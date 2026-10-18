@@ -559,6 +559,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_pictures_of_a_second_picture_parameter_set() {
+        // Every other picture refers to the second of the two picture
+        // parameter sets in the file's avcC box, as camera and broadcast
+        // files may give B-pictures one of their own.
+        let data = fixture("video-two-pps.mp4");
+        let mut video = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
+        let (pictures, _, _) = timeline(&mut video);
+        assert_eq!(
+            pictures,
+            (0..12).map(|index| index * 40).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn reorders_pictures_by_what_the_stream_says() {
         // Matroska doesn't say how far B-frames reorder pictures; H264's
         // sequence parameter set does.

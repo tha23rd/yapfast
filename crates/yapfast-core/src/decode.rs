@@ -215,21 +215,84 @@ mod tests {
         check(Codec::H264, &h264[..second]);
     }
 
-    #[test]
-    fn follows_parameter_sets_to_new_ids() {
-        // Twelve pairs of pictures, each pair after parameter sets of ids of
-        // its own and of another size, as a sender may rotate them. A
-        // damaged sequence parameter set under an id of its own changes
-        // nothing.
-        let h264 = fixture("stream-h264-ids.h264");
+    /// A recorded stream's access units, up to each delimiter.
+    fn units(h264: &[u8]) -> Vec<&[u8]> {
         let mut starts: Vec<_> = (0..h264.len() - 4)
             .filter(|&at| h264[at..at + 5] == [0, 0, 0, 1, 9])
             .collect();
         starts.push(h264.len());
+        starts
+            .windows(2)
+            .map(|unit| &h264[unit[0]..unit[1]])
+            .collect()
+    }
+
+    #[test]
+    fn refuses_pictures_larger_than_they_show() {
+        // Sequence parameter sets coding 16384 by 16384 pixels, wider than
+        // Yapfast decodes, and 8192 by 8192, more macroblocks than H264 has,
+        // each cropped to 16 by 16, in place of the recorded stream's: no
+        // session is made for them, and the stream's own decodes after.
+        // FFmpeg, on the other platforms, takes the second.
+        let wide = [
+            0x67, 0x42, 0xc0, 0x33, 0xda, 0x00, 0x10, 0x00, 0x00, 0x80, 0x1e, 0x00, 0x1f, 0xf9,
+            0x80, 0x07, 0xfe, 0x50,
+        ];
+        let many = [
+            0x67, 0x42, 0xc0, 0x33, 0xda, 0x00, 0x20, 0x00, 0x04, 0x01, 0xe0, 0x03, 0xfe, 0x60,
+            0x03, 0xfe, 0x50,
+        ];
+        let h264 = fixture("stream-h264.h264");
+        let first = units(&h264)[0];
+        let start = (0..first.len() - 5)
+            .find(|&at| first[at..at + 5] == [0, 0, 0, 1, 0x67])
+            .unwrap()
+            + 4;
+        let end = (start..first.len() - 4)
+            .find(|&at| first[at..at + 4] == [0, 0, 0, 1])
+            .unwrap();
+        for (sps, refused) in [(&wide[..], true), (&many[..], cfg!(target_os = "macos"))] {
+            let mut decoder = Decoder::new(Codec::H264).unwrap();
+            let crafted = [&first[..start], sps, &first[end..]].concat();
+            let started = std::time::Instant::now();
+            let shown = matches!(decoder.decode(&crafted), Ok(Some(_)));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert!(!refused || !shown, "{sps:x?}");
+            let picture = decoder.decode(first).unwrap().expect("a picture");
+            assert_eq!((picture.width, picture.height), (320, 180));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn starts_sessions_four_times_a_second_at_most() {
+        // IDR pictures of two streams in turn, of parameter sets under ids of
+        // their own, each taking a session of its own: past four a second,
+        // the session there is goes on, and the other stream's don't decode.
+        let h264 = fixture("stream-h264-ids.h264");
+        let units = units(&h264);
+        let mut decoder = Decoder::new(Codec::H264).unwrap();
+        let mut second = 0;
+        for index in 0..40 {
+            let unit = units[if index % 2 == 0 { 0 } else { 2 }];
+            if let Ok(Some(picture)) = decoder.decode(unit) {
+                second += usize::from(picture.width == 48);
+            }
+        }
+        assert!(second <= 5, "{second} of the second stream's 20");
+    }
+
+    #[test]
+    fn follows_parameter_sets_to_new_ids() {
+        // Five pairs of pictures, each pair after parameter sets of ids of
+        // its own and of another size, as a sender may rotate them. A
+        // damaged sequence parameter set under an id of its own changes
+        // nothing.
+        let h264 = fixture("stream-h264-ids.h264");
         let mut decoder = Decoder::new(Codec::H264).unwrap();
         let mut sizes = vec![];
-        for (index, unit) in starts.windows(2).enumerate() {
-            let mut unit = h264[unit[0]..unit[1]].to_vec();
+        for (index, unit) in units(&h264).into_iter().enumerate() {
+            let mut unit = unit.to_vec();
             if index == 5 {
                 let damaged = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0x04, 0x1f, 0xff, 0xff];
                 unit.splice(0..0, damaged);
@@ -237,7 +300,7 @@ mod tests {
             let picture = decoder.decode(&unit).unwrap().expect("a picture");
             sizes.push((picture.width, picture.height));
         }
-        let expected: Vec<_> = (0..24)
+        let expected: Vec<_> = (0..10)
             .map(|index| [(32, 18), (48, 32)][index / 2 % 2])
             .collect();
         assert_eq!(sizes, expected);

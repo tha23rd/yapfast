@@ -122,20 +122,28 @@ decodes those through the system instead, where FFmpeg has no decoder:
   hardware decoder, synchronously on the caller's thread. An MP4 file's avcC
   box gives it the parameter sets; a Go Live stream's come in its Annex B
   access units, which it rewrites with lengths. It keeps the sets under their
-  ids, as many as H264 has and none longer than 4 KiB, and makes each session
-  from the picture parameter set a slice refers to and the sequence one that
-  refers to, so a sender that gives each size sets of new ids, as OpenH264
-  can, and a damaged set under an id of its own, change nothing else. A new
-  session starts when those sets change, in the stream, in an MP4 file's
-  samples or in a new sample description, but only at an IDR or intra-coded
-  picture, as the pictures before one refer to what the session decoded:
+  ids, as many as H264 has and none longer than 4 KiB, and leaves out a
+  sequence parameter set coding a picture wider or taller than 8192 pixels
+  or of more macroblocks than H264 has, however little of it shows: for one
+  of 16384 by 16384 cropped to 16 by 16, VideoToolbox made a session and
+  decoded. An MP4 sample carrying a set left out isn't decoded, as
+  VideoToolbox reads the sets in samples too. Each session is made from the
+  sequence parameter set the slices' picture one refers to and every picture
+  one that refers to it, as camera and broadcast files may give B-pictures
+  one of their own, so a sender that gives each size sets of new ids, as
+  OpenH264 can, and a damaged set under an id of its own, change nothing
+  else. A new session starts when those sets change, in the stream, in an
+  MP4 file's samples or in a new sample description, but only at an IDR
+  picture, as the pictures before one may refer to what the session decoded:
   VideoToolbox says a session can take a format of new ids of the same size,
   but then decodes none of the pictures after. One starts too after a seek,
   so the pictures after the keyframe can't refer to any from before, and when
   VideoToolbox says the session stopped working, as after the Mac sleeps,
-  decoding the access unit again when it's such a picture, and otherwise from
-  the next one; a session that keeps stopping starts again once a second at
-  most. VideoToolbox gives pictures in decode order, so it holds back as many
+  decoding the access unit again when it's an IDR or intra-coded picture, and
+  otherwise from the next one. The stream starts four sessions a second at
+  most, however it asks, past which the session there is goes on, or the
+  access unit isn't decoded; the first after opening or a seek doesn't count.
+  VideoToolbox gives pictures in decode order, so it holds back as many
   as B-frames reorder by and gives them by presentation time: as many as
   MP4's demuxer counts (`video_delay`), or for another file, as a Matroska or
   a fragmented MP4 one, as many as the sequence parameter set's VUI says,
