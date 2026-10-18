@@ -727,8 +727,12 @@ as plain Opus RTP on the stream's audio SSRC, DAVE-encrypted, with sender
 reports, and op 5 marks them as shared sound (speaking flag 2). Nothing is
 sent while no application plays. On Windows, WASAPI's process loopback hears
 everything but Yapfast's own process tree as one stream, from Windows 10's 2004
-update on; it can't leave other Discord clients out. Other systems share
-video only for now, and so does the test pattern. Two ignored tests check the capture against the
+update on; it can't leave other Discord clients out. On macOS, from 14.2 on, a
+Core Audio process tap hears everything as one stream too, leaving out
+Yapfast's processes and other Discord clients by process id, program or bundle
+id, after macOS asks once whether Yapfast may record it; see
+[the macOS guide](macos.md#go-lives-sound). Other systems share video only
+for now, and so does the test pattern. Two ignored tests check the capture against the
 machine's sound server with a quiet tone: another process's is heard, and
 Yapfast's own is not.
 

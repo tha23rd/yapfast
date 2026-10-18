@@ -128,12 +128,13 @@ For Macs with Apple silicon (M1 and newer), on macOS 11 or later.
    refuses: open **System Settings → Privacy & Security**, scroll down to the
    note about Yapfast, and choose **Open Anyway**.
 3. Link your account with the QR code, as on Windows. macOS asks once for the
-   microphone when you first join a voice channel, and once for notifications.
+   microphone when you first join a voice channel, once for notifications,
+   and once for your apps' sound when you first go live, which needs macOS
+   14.2 or later.
 
 Closing the window keeps Yapfast in the menu bar, so messages and calls still
 reach you; click its icon there, or Yapfast in the Dock, to bring it back.
-Cameras, sharing your apps' sound with Go Live, starting at login and Intel
-Macs aren't covered yet.
+Cameras, starting at login and Intel Macs aren't covered yet.
 
 ## Features
 

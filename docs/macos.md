@@ -20,6 +20,9 @@ Discord token.
 4. Join a voice channel. macOS asks once for the microphone, naming why from
    `NSMicrophoneUsageDescription` in `packaging/macos/Info.plist`; without
    it, the microphone records silence. It asks once for notifications too.
+5. Go Live. On macOS 14.2 or later, the first share asks once whether Yapfast
+   may record what other applications play, naming why from
+   `NSAudioCaptureUsageDescription`; without it, the stream has no sound.
 
 Opened from the Finder or the Dock, Yapfast's output goes nowhere, so it
 writes its diagnostics to `yapfast.log` in its data folder,
@@ -29,9 +32,8 @@ Windows; started from a terminal, as
 Yapfast renders with Skia Software; `--renderer gpu` draws with Skia on Metal.
 
 Not there yet on the Mac: cameras (`camera.rs` captures through V4L2 and
-DirectShow only), sharing other applications' sound with Go Live, which on
-Linux and Windows comes from the sound server, and starting at sign-in. Each
-is hidden or says so where it would be.
+DirectShow only) and starting at sign-in. Each is hidden or says so where it
+would be.
 
 ## Build
 
@@ -258,6 +260,53 @@ queue absorbed, the device's latency missing, a stall or a failed reopen
 ending the call's sound for good, a restart's wait after every underrun, an
 enqueue under the lock the callback takes, thin microphone buffering, refused
 buffers going unnoticed, and an unaligned read of the stream configuration.
+
+### Go Live's sound
+
+A shared screen carries what other applications play, which
+`audio_io/coreaudio/others.rs` hears through a Core Audio process tap, as
+Chromium's tab and system audio capture does on the Mac. Taps came with macOS
+14.2; before it, sharing goes without sound and the worker logs "Yapfast
+shares other applications' sound on macOS 14.2 or later". Yapfast still
+starts there: it looks up `AudioHardwareCreateProcessTap` and
+`AudioHardwareDestroyProcessTap` with `dlsym`, and `CATapDescription` by name,
+as it runs, where linking them would stop it starting.
+
+The tap is a private, stereo, global one: everything every process plays,
+whatever device it plays on, but the process objects it names. A private
+aggregate device has it as its only input, with drift compensation, and runs
+at 48 kHz, so Core Audio resamples the mix to Go Live's rate; Yapfast checks
+that the device's input is then 32-bit float stereo, interleaved, at 48 kHz.
+The device's IOProc hands each buffer to the mixer as it is, on Core Audio's
+own thread, except buffers that are silence through and through, so nothing
+is sent while nothing plays, as on Windows. The tap leaves out the stream
+worker and the Yapfast that started it, by process id, and processes whose
+program or bundle id is Yapfast's or a Discord client's, as on Linux: so
+Yapfast's other workers, such as one playing a watched stream (`yapfast`),
+and Discord's (`Discord Helper (Renderer)`, `com.hnc.Discord.helper`). A
+process has a process object only once it uses sound, so the worker looks at
+their list every half second and, when what to leave out changed, gives the
+tap a new description; one read of a property while nothing changes.
+
+macOS asks once whether Yapfast may record other applications' sound, and
+holds the first change to the tap until the person answers, so the first
+share's video waits for the answer too. Refused, a tap hears silence and
+refuses any change to it with `kAudioDevicePermissionsError`, so the worker
+gives it its description again before starting: refused, it logs where to
+allow it, System Settings → Privacy & Security → Screen & System Audio
+Recording, and shares without sound. Unanswered for about three and a half
+minutes, the change times out (`MACH_RCV_TIMED_OUT`), which the worker
+takes as refused. The permission belongs to Yapfast.app, the worker being one
+of its processes; an unbundled build run over SSH is refused without asking.
+
+Checked on the MacBook Air (macOS 15.3) with
+`audio_io::tests::hears_other_applications`: run over SSH, unbundled, it
+makes the tap and its device, whose input is then 32-bit float stereo at
+48 kHz, and macOS refuses the change with `kAudioDevicePermissionsError`.
+Run from a copy of Yapfast.app holding the test binary, signed as Yapfast's
+own, macOS asked; nobody was there to answer, and the change timed out
+after 210 seconds. Hearing a tone another process plays, and not this one's,
+still needs the permission allowed.
 
 ## Resources
 
