@@ -978,6 +978,9 @@ pub enum Action {
     MarkRead(String),
     /// Go to wherever a conversation is listed and open it, as a notification does.
     Open(String),
+    /// As [`Action::Open`], for a clicked notification, which may come
+    /// before the conversation is listed; see `open_notified`.
+    OpenNotified(String),
     /// Show a Discord thread beside the open channel, as its link in a
     /// message does; anything else opens as [`Action::Open`] does.
     OpenAside(String),
@@ -1486,6 +1489,9 @@ pub struct Application {
     pending_open: Option<String>,
     /// A thread to show beside the selected channel once it's listed.
     pending_aside: Option<String>,
+    /// A clicked notification's conversation, until Discord's lists have it
+    /// or Discord is online.
+    pending_notified: Option<String>,
     /// A thread just started, whose first message, its draft, goes once
     /// it shows beside its channel.
     first_message: Option<String>,
@@ -1724,6 +1730,11 @@ impl Application {
                 effects.extend(self.dispatch(Action::RequestJoinVoice(room)));
             }
         }
+        if let Some(room) = self.pending_notified.take_if(|room| {
+            self.state.discord_online || self.state.rooms.iter().any(|listed| &listed.id == room)
+        }) {
+            effects.extend(self.dispatch(Action::Open(room)));
+        }
         if let Some(room) = self
             .pending_aside
             .take_if(|room| self.state.rooms.iter().any(|listed| &listed.id == room))
@@ -1861,6 +1872,7 @@ impl Application {
                 self.show_panel_profile()
             }
             Action::Open(id) => self.open(id),
+            Action::OpenNotified(id) => self.open_notified(id),
             Action::OpenAside(id) => self.open_aside(id),
             Action::CloseAside => self.close_aside(),
             Action::ExpandAside => self.expand_aside(),

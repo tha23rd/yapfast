@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use objc2_audio_toolbox::{
     AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer,
     AudioQueueNewInput, AudioQueueNewOutput, AudioQueuePause, AudioQueueRef, AudioQueueSetProperty,
@@ -254,7 +254,7 @@ impl Stream {
             fresh: true,
             retried: false,
         };
-        stream.make(device)?;
+        stream.make(device, follows)?;
         Ok(stream)
     }
 
@@ -271,7 +271,7 @@ impl Stream {
     /// Swapped in, it takes the place of the one before, whose buffers and
     /// what they held go with it. A microphone's starts recording; speakers'
     /// buffers wait to be written.
-    fn make(&mut self, device: AudioObjectID) -> Result<()> {
+    fn make(&mut self, device: AudioObjectID, follows: bool) -> Result<()> {
         let uid = string(device, kAudioDevicePropertyDeviceUID).context("device not found")?;
         let mut made: AudioQueueRef = null_mut();
         let shared = Arc::as_ptr(&self.shared).cast_mut().cast();
@@ -328,6 +328,16 @@ impl Stream {
             )?;
             buffers.push(Buffer(buffer));
         }
+        if self.input() {
+            for Buffer(buffer) in buffers.drain(..) {
+                // SAFETY: a buffer of this queue's, which records nothing
+                // and calls back for nothing until started.
+                check(
+                    unsafe { AudioQueueEnqueueBuffer(made, buffer, 0, null()) },
+                    "the microphone refused a buffer",
+                )?;
+            }
+        }
         {
             let mut state = self.shared.lock();
             state.queue = made as usize;
@@ -349,18 +359,18 @@ impl Stream {
         // lock, and is ignored from here on.
         self.queue = Some(queue);
         self.device = device;
+        self.follows = follows;
         self.latency = device_latency(device, self.scope);
         self.retry = None;
-        for Buffer(buffer) in buffers {
-            // SAFETY: a microphone's buffer of this queue's.
-            check(
-                unsafe { AudioQueueEnqueueBuffer(made, buffer, 0, null()) },
-                "the microphone refused a buffer",
-            )?;
-        }
         if self.input() {
             self.shared.lock().running = true;
-            self.start()?;
+            if let Err(error) = self.start() {
+                // Swapped in already: it's tried again in a moment.
+                let mut state = self.shared.lock();
+                state.running = false;
+                state.failed = true;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -391,9 +401,7 @@ impl Stream {
             Err(_) => find(None, self.scope)?,
         };
         tracing::info!(why, follows, input = self.input(), "sound opened again");
-        self.make(device)?;
-        self.follows = follows;
-        Ok(())
+        self.make(device, follows)
     }
 
     /// Follows the default device, and replaces a queue whose device is gone
@@ -497,7 +505,10 @@ impl Output {
         while rest.len() >= frame {
             self.stream.look();
             let mut state = shared.lock();
-            let Some(&Buffer(buffer)) = state.free.back() else {
+            // A queue that failed waits for look() to replace it, rather
+            // than taking what's written and losing it.
+            let free = state.free.back().filter(|_| !state.failed);
+            let Some(&Buffer(buffer)) = free else {
                 self.stream.wait(state, "the speakers stopped playing")?;
                 continue;
             };
@@ -520,6 +531,7 @@ impl Output {
                 continue;
             }
             let full = take_filled(&mut state);
+            let again = state.waiting;
             let given = if state.waiting {
                 // Until they're all full, or what's written drains.
                 state.ready.extend(full);
@@ -532,13 +544,14 @@ impl Output {
                 full.into_iter().collect()
             };
             drop(state);
-            self.give(given)?;
+            self.give(given, again);
         }
         Ok(())
     }
 
-    /// Gives the queue filled buffers, starting it if it isn't running.
-    fn give(&mut self, buffers: Vec<Buffer>) -> Result<()> {
+    /// Gives the queue filled buffers, starting it if it isn't running, or
+    /// `again`, after it ran dry, in case the system stopped it meanwhile.
+    fn give(&mut self, buffers: Vec<Buffer>, again: bool) {
         let queue = self.stream.queue();
         let start = {
             let mut state = self.stream.shared.lock();
@@ -546,7 +559,7 @@ impl Output {
                 // SAFETY: a buffer of this queue's, which it doesn't have yet.
                 state.queued += unsafe { (**buffer).mAudioDataByteSize } as usize;
             }
-            !std::mem::replace(&mut state.running, true)
+            !std::mem::replace(&mut state.running, true) || again
         };
         // Outside the lock, which the queue's callback takes: an enqueue
         // that waited for the callback would wait for this.
@@ -563,49 +576,38 @@ impl Output {
                 }
             }
         }
-        if start {
-            self.stream.start()?;
+        if start && let Err(error) = self.stream.start() {
+            // The next look makes a new queue.
+            tracing::warn!(error = format!("{error:#}"), "the speakers wouldn't start");
+            let mut state = self.stream.shared.lock();
+            if state.current(queue) {
+                state.running = false;
+                state.failed = true;
+            }
         }
-        Ok(())
     }
 
     pub fn drain(&mut self) -> Result<()> {
         let shared = self.stream.shared.clone();
-        let (given, started) = {
+        let (given, started, again) = {
             let mut state = shared.lock();
             let mut given = std::mem::take(&mut state.ready);
             given.extend(take_filled(&mut state));
-            state.waiting = false;
             if given.is_empty() && state.queued == 0 {
+                if state.running && state.current(self.stream.queue()) {
+                    state.running = false;
+                    // SAFETY: the queue has no buffers, so its callback
+                    // won't run.
+                    unsafe { AudioQueuePause(self.stream.queue()) };
+                }
                 return Ok(());
             }
+            let again = std::mem::replace(&mut state.waiting, false);
             state.draining = true;
-            (given, !state.running)
+            (given, !state.running, again)
         };
-        let drained = self.give(given).and_then(|()| {
-            // A queue just started may take a moment to start playing.
-            let starting = if started || self.stream.fresh {
-                SPEAKERS_STARTING
-            } else {
-                Duration::ZERO
-            };
-            let deadline = Instant::now()
-                + self.duration(shared.lock().queued)
-                + self.stream.latency
-                + starting
-                + Duration::from_secs(1);
-            loop {
-                self.stream.look();
-                let state = shared.lock();
-                if state.queued == 0 {
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err(anyhow!("the speakers stopped playing"));
-                }
-                self.stream.wait(state, "the speakers stopped playing")?;
-            }
-        });
+        self.give(given, again);
+        let drained = self.played(started);
         // The device plays what it took last before the queue pauses.
         if drained.is_ok() {
             std::thread::sleep(self.stream.latency.min(Duration::from_millis(500)));
@@ -621,13 +623,40 @@ impl Output {
         drained
     }
 
+    /// Waits until the queue has played everything it has.
+    fn played(&mut self, started: bool) -> Result<()> {
+        let shared = self.stream.shared.clone();
+        // A queue just started may take a moment to start playing.
+        let starting = if started || self.stream.fresh {
+            SPEAKERS_STARTING
+        } else {
+            Duration::ZERO
+        };
+        let deadline = Instant::now()
+            + self.duration(shared.lock().queued)
+            + self.stream.latency
+            + starting
+            + Duration::from_secs(1);
+        loop {
+            self.stream.look();
+            let state = shared.lock();
+            if state.queued == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("the speakers stopped playing");
+            }
+            self.stream.wait(state, "the speakers stopped playing")?;
+        }
+    }
+
     /// Drops what's queued with the queue, for a new one on the same device.
     pub fn flush(&mut self) {
         let unplayed = {
             let state = self.stream.shared.lock();
             state.queued + state.filled > 0 || !state.ready.is_empty()
         };
-        if unplayed && let Err(error) = self.stream.make(self.stream.device) {
+        if unplayed && let Err(error) = self.stream.make(self.stream.device, self.stream.follows) {
             tracing::warn!(error = format!("{error:#}"), "could not drop queued sound");
             let mut state = self.stream.shared.lock();
             state.filled = 0;
@@ -802,7 +831,7 @@ fn find(id: Option<&str>, scope: AudioObjectPropertyScope) -> Result<(AudioObjec
     };
     let name = id.strip_prefix(NAMED);
     for device in devices()? {
-        if !has_streams(device, scope) {
+        if !has_streams(device, scope) || !alive(device) {
             continue;
         }
         let found = match name {

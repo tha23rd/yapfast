@@ -590,9 +590,10 @@ mod macos {
         }
     );
 
-    /// Runs `chosen` once AppKit is done with the click.
-    fn choose(chosen: fn(Choice), choice: Choice) {
-        let _ = slint::invoke_from_event_loop(move || chosen(choice));
+    /// Runs `chosen` once AppKit is done with the click; false once Slint's
+    /// event loop is gone.
+    fn choose(chosen: fn(Choice), choice: Choice) -> bool {
+        slint::invoke_from_event_loop(move || chosen(choice)).is_ok()
     }
 
     pub struct Tray {
@@ -726,8 +727,7 @@ mod macos {
             _: &AnyObject,
         ) -> NSApplicationTerminateReply {
             match CHOSEN.get() {
-                Some(chosen) if !powering_off() => {
-                    choose(chosen, Choice::Quit);
+                Some(chosen) if !powering_off() && choose(chosen, Choice::Quit) => {
                     NSApplicationTerminateReply::TerminateCancel
                 }
                 _ => NSApplicationTerminateReply::TerminateNow,

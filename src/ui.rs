@@ -401,21 +401,23 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                         WindowEvent::KeyboardInput { event, .. }
                             if command && event.state == ElementState::Pressed && !event.repeat =>
                         {
-                            // The letter typed, in any case; where the layout
-                            // types no Latin letter, the key's place.
+                            // The character typed, in either case; where the
+                            // layout types no Latin character, as Cyrillic
+                            // and Greek don't, the key's place. A layout's own
+                            // comma stays a comma, Command-, being Settings.
                             let typed = match event.logical_key.as_ref() {
-                                Key::Character(typed) => typed
-                                    .chars()
-                                    .next()
-                                    .filter(char::is_ascii_alphabetic)
-                                    .map(|letter| letter.to_ascii_lowercase()),
+                                Key::Character(typed) => typed.chars().next(),
                                 _ => None,
                             };
-                            let letter = typed.or(match event.physical_key {
-                                PhysicalKey::Code(KeyCode::KeyW) => Some('w'),
-                                PhysicalKey::Code(KeyCode::KeyM) => Some('m'),
-                                _ => None,
-                            });
+                            let letter = match typed {
+                                Some(typed) if typed.is_ascii() => Some(typed.to_ascii_lowercase()),
+                                Some(_) => match event.physical_key {
+                                    PhysicalKey::Code(KeyCode::KeyW) => Some('w'),
+                                    PhysicalKey::Code(KeyCode::KeyM) => Some('m'),
+                                    _ => None,
+                                },
+                                None => None,
+                            };
                             match letter {
                                 Some('w') => {
                                     slint_window.dispatch_event(

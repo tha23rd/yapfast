@@ -2070,6 +2070,46 @@ fn login_recovery_and_error_state_do_not_depend_on_widgets() {
     assert!(!app.state.busy);
 }
 
+/// A notification clicked before Discord's lists came, as one that starts
+/// Yapfast on macOS, opens its conversation once they have it; an ordinary
+/// open of a conversation that isn't listed still asks for nothing.
+#[test]
+#[cfg(feature = "discord")]
+fn a_notification_clicked_before_discord_lists_opens_once_they_do() {
+    use yapfast_discord::{
+        ready::{Channel, Server},
+        service::{Snapshot, Status},
+    };
+    let mut app = Application::default();
+    assert!(
+        app.dispatch(Action::Open("discord:10:11".into()))
+            .is_empty()
+    );
+    // Not the first channel, which opens by default.
+    assert!(
+        app.dispatch(Action::OpenNotified("discord:10:12".into()))
+            .is_empty()
+    );
+    assert_eq!(app.state.selected, None);
+    app.apply(discord_event(Snapshot {
+        status: Status::Online,
+        servers: vec![Arc::new(Server {
+            id: "10".into(),
+            name: "Test".into(),
+            text_channels: ["11", "12"]
+                .map(|id| Channel {
+                    id: id.into(),
+                    name: format!("channel {id}"),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        })],
+        ..Default::default()
+    }));
+    assert_eq!(app.state.selected.as_deref(), Some("discord:10:12"));
+}
+
 #[test]
 #[cfg(feature = "discord")]
 fn discord_channels_join_unless_locked_and_hidden_ones_show_on_request() {

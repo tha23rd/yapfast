@@ -383,12 +383,6 @@ impl Application {
 
     pub(super) fn open(&mut self, id: String) -> Vec<Effect> {
         let Some(room) = self.state.rooms.iter().find(|room| room.id == id) else {
-            // Asked for before Discord's lists came, as by a notification
-            // that started Yapfast on macOS: it opens once they have it.
-            if !self.state.discord_online && !self.state.preview {
-                self.pending_open = Some(id);
-                return vec![];
-            }
             return self.open_thread(id, false);
         };
         let navigation = if room.direct {
@@ -405,6 +399,23 @@ impl Application {
             .unwrap_or_default();
         effects.extend(self.select(id));
         effects
+    }
+
+    /// Opens a notification's conversation. On macOS, clicking one can start
+    /// Yapfast, before Discord's lists came: then a Discord conversation not
+    /// listed yet opens once they have it, or, once Discord is online, as
+    /// [`Self::open`] would.
+    pub(super) fn open_notified(&mut self, id: String) -> Vec<Effect> {
+        let listed = self.state.rooms.iter().any(|room| room.id == id);
+        if !listed
+            && !self.state.discord_online
+            && !self.state.preview
+            && discord::parse_room(&id).is_some()
+        {
+            self.pending_notified = Some(id);
+            return vec![];
+        }
+        self.open(id)
     }
 
     /// Opens a Discord thread that isn't listed, as a message's link to it
