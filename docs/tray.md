@@ -173,6 +173,16 @@ the screen, not SSH ones, and `ProcessType` `Interactive` gives it what an
 app opened from the Finder has, for calls. Each start leaves an entry that's
 already right alone.
 
+winit makes the app active as it finishes launching, which, started at
+sign-in with no window, would take the keyboard from the app in front. So
+`ui::run` decides whether to start hidden before it picks the backend, and
+for a hidden start gives winit an event loop with
+`with_activate_ignoring_other_apps(false)`. Yapfast stays a regular app, with
+its Dock icon from the start, which opens the window, as it does after the
+window closes. An accessory app until a window shows would have no Dock icon
+to open it from, an icon that came and went, and winit would still activate
+it.
+
 From macOS 13, System Settings → General → Login Items lists the agent under
 Allow in the Background, with a switch, and macOS says so in a notification,
 Background Items Added, when it's first written.

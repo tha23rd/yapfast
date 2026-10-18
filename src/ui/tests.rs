@@ -431,6 +431,16 @@ fn preferences_set_the_clock_text_size_previews_and_unmuting() {
 }
 
 #[test]
+fn starting_in_the_tray_needs_something_to_show_there() {
+    let never = || -> bool { panic!("the credential store is read only when it matters") };
+    assert!(!starts_hidden(false, false, never));
+    assert!(!starts_hidden(false, true, never));
+    assert!(starts_hidden(true, true, never));
+    assert!(starts_hidden(true, false, || true));
+    assert!(!starts_hidden(true, false, || false));
+}
+
+#[test]
 fn each_sounds_own_volume_counts_only_while_adjusting_each() {
     i_slint_backend_testing::init_no_event_loop();
     let defaults: Layout = serde_json::from_str("{}").unwrap();

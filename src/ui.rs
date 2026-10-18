@@ -106,11 +106,26 @@ pub fn run(
         graphics::Renderer::Gpu => "skia-opengl",
         graphics::Renderer::Software => "skia-software",
     };
+    let hidden = starts_hidden(background, preview, || {
+        yapfast_core::chat::can_restore(&root)
+    });
     let mut selector = slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name(renderer.into());
     if metal {
         selector = selector.require_metal();
+    }
+    // winit makes Yapfast the active app as it starts, which started at
+    // sign-in, with no window, would take the keyboard from the app in front.
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::{
+            SlintEvent,
+            winit::{event_loop::EventLoop, platform::macos::EventLoopBuilderExtMacOS as _},
+        };
+        let mut builder = EventLoop::<SlintEvent>::with_user_event();
+        builder.with_activate_ignoring_other_apps(!hidden);
+        selector = selector.with_winit_event_loop_builder(builder);
     }
     selector
         .with_winit_window_attributes_hook(crate::icon::attributes)
@@ -127,10 +142,6 @@ pub fn run(
             Err(anyhow::Error::new(error).context(context))
         }
     };
-    // Started at sign-in, Yapfast goes to the tray with the saved session, or
-    // the preview's sample conversations, which show it without an account.
-    // Without one there's nothing to do there but sign in, which needs the window.
-    let hidden = background && (preview || yapfast_core::chat::can_restore(&root));
     let window = match YapfastWindow::new() {
         Ok(window) => window,
         Err(error) => return failed(error, "could not create the Yapfast window"),
@@ -215,6 +226,15 @@ pub fn run(
 /// Only the private test compositor can request a different initial size.
 fn isolated_display() -> bool {
     std::env::var("YAPFAST_FRAMEWORK_ISOLATED_DISPLAY").as_deref() == Ok("1")
+}
+
+/// Whether Yapfast starts in the tray: started at sign-in, with the saved
+/// session, or the preview's sample conversations, which show it without an
+/// account. Without either there's nothing to do there but sign in, which
+/// needs the window. `can_restore` reads the credential store, so only when
+/// it matters.
+fn starts_hidden(background: bool, preview: bool, can_restore: impl FnOnce() -> bool) -> bool {
+    background && (preview || can_restore())
 }
 
 fn prepare(window: &YapfastWindow) {
