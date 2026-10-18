@@ -823,3 +823,36 @@ shows at once.
 
 Reproduce: `python3 testing/measure_tray.py --output .local/measure-tray`,
 and with `--runs 1 --renderer gpu` for the GPU column.
+
+## 2026-10-18: macOS on Apple silicon
+
+The record measures the Discord-only `measure` build on a MacBook Air (M4,
+24 GB, macOS 15.3), launched as an app bundle, on the fake Discord with four
+servers, 20 DMs and pictures (`--servers 4 --dms 20 --images 4`), #general
+open at 1120×760 on the built-in Retina display, at twice that in pixels.
+Memory is `footprint`'s `phys_footprint`, which Activity Monitor shows: the
+process's dirty and compressed memory, its IOSurfaces and GPU allocations
+among them, closest to Windows' private working set. CPU is the process's
+time over the window. Each sample is 30 s after the window settled; closed is
+after Command-W, 60 s with Software, 30 s with the GPU.
+
+| Renderer | Open | Closed to the menu bar | CPU open | CPU closed |
+| --- | --- | --- | --- | --- |
+| Skia Software | 50.0 MB | 33.1 MB | 0.10% | 0.22% |
+| Skia on Metal | 114.0 MB | 38.3 MB | 0.20% | 0.03% |
+| Skia on OpenGL | 156.0 MB | 72.4 MB | 0.03% | 0.13% |
+
+With Software, closing saves 17 MB, most of it the window's surface: 2240×1520
+pixels at four bytes is 13.6 MB, four times a 1× display's. On Metal, 40 MB
+are IOSurfaces and 37 MB the GPU driver's; on OpenGL, which Apple's driver
+runs over Metal, 65 MB and 53 MB. So the GPU setting uses Metal on the Mac.
+CPU is a percentage of one core, under a quarter of one idle with either.
+
+A call, a real account, startup time and GPU utilization, which needs root
+through `powermetrics`, remain unmeasured.
+
+Reproduce: start `bun testing/fake_discord.ts --port PORT --servers 4 --dms 20
+--images 4`, open the app bundle with `open -n Yapfast.app --env
+YAPFAST_DISCORD_TEST_SERVER=http://127.0.0.1:PORT --args --data-dir DIR`
+(and `--renderer gpu`), open #general, then sample `footprint PID` and `ps -o
+time= -p PID`.

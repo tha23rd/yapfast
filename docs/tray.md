@@ -132,10 +132,18 @@ A Mac app with its window closed keeps its Dock icon, and clicking that should
 bring the window back. AppKit asks the application delegate,
 `applicationShouldHandleReopen:hasVisibleWindows:`, and winit's delegate
 doesn't answer, so Yapfast adds that method to winit's class when the tray
-starts: with no window showing, it opens one, as Open Yapfast does. Command-Q
-quits from the app menu, as everywhere on the Mac; Command-W closes the window
-into the menu bar, and Command-M minimizes it (`src/ui.rs`), which winit's
-menu leaves out.
+starts: it opens the window, as Open Yapfast does, whatever AppKit counts as
+showing. Opening makes Yapfast the active app too, as a click in the menu bar
+or in Notification Center doesn't, so the window comes in front.
+
+Command-Q, or Quit in the Dock, asks the delegate
+`applicationShouldTerminate:`, which winit doesn't answer either, so AppKit
+would end the process where it stands, in a call or with what Yapfast saves
+unsaved. Yapfast's answer cancels that and quits as the menu bar's Quit does,
+then ends; when the Mac is logging out, restarting or shutting down, which
+the quit event's reason says, it lets AppKit go on, as cancelling would stop
+that. Command-W closes the window into the menu bar, and Command-M minimizes
+it (`src/ui.rs`), in any keyboard layout, which winit's menu leaves out.
 
 Starting at sign-in isn't there on macOS yet, so Settings doesn't show it.
 

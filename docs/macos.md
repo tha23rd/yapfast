@@ -147,28 +147,34 @@ on a thread of its own.
 
 Speakers queue in the queue's own 10 ms buffers, as many as the queue asked
 for: six for Discord voice's 60 ms. Writing fills a free buffer and gives it to
-the queue, waiting while the queue has them all. The queue starts once it
-has them all, or when draining, and pauses when it hands the last back, so
-all 60 ms absorb a late write, as with PulseAudio's prebuffering, and an
-idle stream, as when deafened, lets the device rest. `latency()` counts what's
-queued and the device's own latency, safety offset and buffer, as Core Audio
-reports them, which for Bluetooth is long; draining waits that out too, so a
-sound's tail isn't cut. Flushing, for a paused or moved video, drops the
-queue for a new one on the same device. Microphones' buffers, about 100 ms of
-them, go back to the queue as soon as they're recorded, their samples into a
-ring that reading takes from.
+the queue, waiting while the queue has them all. Before the queue first
+plays, and after it runs dry, filled buffers wait until all are, then go
+together, so all 60 ms absorb a late write, as with PulseAudio's prebuffering;
+the queue runs on meanwhile, starved, so playing again costs no restart.
+Draining pauses it, so the device may rest. Buffers go to the queue outside
+the lock its callback takes. `latency()` counts what's queued and the device's
+own latency, safety offset and buffer, as Core Audio reports them, which for
+Bluetooth is long; draining waits that out before pausing, so a sound's tail
+isn't cut. Flushing, for a paused or moved video, swaps the queue for a new
+one on the same device. Microphones' buffers, about 100 ms of them, go back
+to the queue as soon as they're recorded, their samples into a ring that
+reading takes from.
 
 LiveKit's macOS device module names the default device `default` and the rest
 by their Core Audio object id, such as `77`; the backend finds the device with
 that id, or that name for an id made from one, and names its UID to the
 queue. A queue keeps the device it opened on, so a stream on the default
 follows it by hand, as PulseAudio moves its streams: every 250 ms, writing and
-reading look at the default, and when it's another device, as when AirPods
-connect, the stream opens a new queue there. A queue that hands nothing back
-for two seconds, as when its device goes away, is made again, on its device if
-it's still there and on the default if not; it fails only if the new one
-stops too. The first buffer after a start may take 30 seconds, as macOS asks
-for the microphone the first time, and Bluetooth devices wake slowly.
+reading look whether the device is still alive and, on the default, whether
+the default is still it. When it isn't, as when AirPods connect or a headset
+is unplugged, the stream makes a queue there, and swaps it in only once it's
+made; one that can't be made yet leaves the old queue playing, to try again a
+second later. Callbacks from the queue being swapped out are ignored. A queue
+that hands nothing back for two seconds is made again, on its device if it's
+still there and on the default if not, and fails only if the new one stops
+too. The first buffer may take 5 seconds after speakers start, as a Bluetooth
+device wakes or changes profile, and 30 after a microphone starts, as macOS
+asks for it the first time.
 
 Not handled yet: Core Audio's object ids change across restarts, and a saved
 device is saved by LiveKit's id, so a device chosen in Settings may be another
@@ -184,15 +190,30 @@ and microphone only:
   second of silence in 20 ms frames into a 60 ms queue in 1.05 s, the device
   taking about 100 ms to start, drains by 1.16 s, and reads a second of
   16 kHz mono in 992 ms.
+- `audio_io::tests::plays_again_after_running_dry` lets the speakers run dry
+  for 300 ms, then writes a second in time, as a call does: it takes 1.003 s,
+  and no write waits more than 68 ms.
 - Following the default and recovering from a device going away need a
   second device, such as Bluetooth headphones, which weren't there.
 
-An adversarial review of the first version found no memory-safety problem
-(the queue's disposal against its callback, Core Foundation ownership, the
-formats) and the issues this version answers: following the default device,
-jitter only half the queue absorbed, the device's latency missing, a stall
-ending the call's sound for good, thin microphone buffering, refused buffers
-going unnoticed, and an unaligned read of the stream configuration.
+Two adversarial reviews found no memory-safety problem (the queue's disposal
+against its callback, Core Foundation ownership, the formats) and the issues
+this version answers: following the default device, jitter only half the
+queue absorbed, the device's latency missing, a stall or a failed reopen
+ending the call's sound for good, a restart's wait after every underrun, an
+enqueue under the lock the callback takes, thin microphone buffering, refused
+buffers going unnoticed, and an unaligned read of the stream configuration.
+
+## Resources
+
+Measured on the MacBook Air with the `measure` build, as
+[the measurements](measurements/README.md#2026-10-18-macos-on-apple-silicon)
+record: on the fake Discord with four servers, 20 DMs and pictures, #general
+open at 1120×760 on its Retina display, Yapfast takes 50 MB with Skia Software
+and 114 MB with Skia on Metal, as Activity Monitor counts it, 33 MB and 38 MB
+closed to the menu bar, and 0.03–0.22% of one core idle. The GPU setting uses
+Metal on the Mac, where OpenGL, which it uses elsewhere, is a layer over it and
+took 156 MB and 72 MB.
 
 ## Checks
 
