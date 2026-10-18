@@ -127,9 +127,10 @@ pub fn run(
             Err(anyhow::Error::new(error).context(context))
         }
     };
-    // Started at sign-in, Yapfast goes to the tray with the saved session.
+    // Started at sign-in, Yapfast goes to the tray with the saved session, or
+    // the preview's sample conversations, which show it without an account.
     // Without one there's nothing to do there but sign in, which needs the window.
-    let hidden = background && !preview && yapfast_core::chat::can_restore(&root);
+    let hidden = background && (preview || yapfast_core::chat::can_restore(&root));
     let window = match YapfastWindow::new() {
         Ok(window) => window,
         Err(error) => return failed(error, "could not create the Yapfast window"),

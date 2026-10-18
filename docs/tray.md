@@ -31,7 +31,8 @@ automatically when Windows starts" writes the same value, and uninstalling remov
 
 `--background` restores the saved session and goes to the tray without
 showing the window, or shows it when there's no session to restore, since
-signing in needs it. Windows knows at once whether the icon went into the
+signing in needs it. With `--preview` it goes to the tray with the sample
+conversations, which shows a start at sign-in without an account. Windows knows at once whether the icon went into the
 notification area; without it the window shows. On Linux the bus says a
 moment later, and a tray that's missing, or goes while the window is closed,
 opens the window. A window made late, from the tray, fails over to Skia
