@@ -99,6 +99,19 @@ impl Shell {
         }
         tracing::info!("started in the tray");
         slint::Timer::single_shot(Duration::from_millis(500), release_memory);
+        // Once AppKit has finished launching, and activated Yapfast if it did.
+        #[cfg(target_os = "macos")]
+        {
+            let shell = Rc::downgrade(self);
+            slint::Timer::single_shot(Duration::from_secs(1), move || {
+                if shell
+                    .upgrade()
+                    .is_some_and(|shell| shell.window().is_none())
+                {
+                    crate::tray::step_aside();
+                }
+            });
+        }
     }
 
     /// Shows the first window, which started hidden for a tray there wasn't.

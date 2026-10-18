@@ -206,7 +206,11 @@ for a hidden start gives winit an event loop with
 its Dock icon from the start, which opens the window, as it does after the
 window closes. An accessory app until a window shows would have no Dock icon
 to open it from, an icon that came and went, and winit would still activate
-it.
+it. Asked not to take the keyboard, winit still activates Yapfast when no
+other app is active, as early at sign-in, so a second after starting in the
+menu bar, with no window yet, Yapfast hides if it's the active app, and the
+next app gets the keyboard; its menu bar icon stays, and opening the window
+shows it again.
 
 With "Reopen windows when logging back in", macOS opens the apps left running
 at log-out again, through LaunchServices, as the person signs back in, while
@@ -264,6 +268,8 @@ this build, outside Applications:
   or written, outside Yapfast stayed so as another setting changed; opening
   Settings read it again; turning it off removed it and enabled relaunching.
   On, off and on at once ended on, with one answer shown.
+- Hidden as `step_aside` hides it, Yapfast's window went off screen and its
+  menu bar icon stayed.
 - `launchctl bootstrap` of that entry, with `--preview` and a data folder of
   its own, as signing in loads it: launchd started Yapfast, which had only its
   menu bar icon on screen, no window, was responsible for itself, and logged

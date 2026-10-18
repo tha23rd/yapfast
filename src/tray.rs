@@ -86,7 +86,7 @@ use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(target_os = "macos")]
-pub use macos::activate;
+pub use macos::{activate, step_aside};
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 use none as platform;
 #[cfg(windows)]
@@ -701,6 +701,21 @@ mod macos {
         // `activate`, which replaces it, needs macOS 14.
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
+    }
+
+    /// Hides Yapfast if it's the active app, which started in the menu bar it
+    /// can be: winit activates it when no other app is active, as early at
+    /// sign-in. The next app then gets the keyboard, rather than a Yapfast
+    /// with no window. The menu bar icon stays, and opening the window shows
+    /// Yapfast again.
+    pub fn step_aside() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        if app.isActive() {
+            app.hide(None);
+        }
     }
 
     /// Teaches winit's application delegate two things Mac apps do, which it
