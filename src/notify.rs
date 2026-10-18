@@ -158,9 +158,11 @@ mod macos {
             center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             center.requestAuthorizationWithOptions_completionHandler(
                 UNAuthorizationOptions::Alert,
-                &RcBlock::new(|allowed: Bool, _: *mut NSError| {
+                &RcBlock::new(|allowed: Bool, error: *mut NSError| {
                     if !allowed.as_bool() {
-                        tracing::info!("notifications are turned off for Yapfast");
+                        // SAFETY: the error the block is given, if any, lives through it.
+                        let code = unsafe { error.as_ref() }.map(|error| error.code());
+                        tracing::info!(?code, "notifications are turned off for Yapfast");
                     }
                 }),
             );
