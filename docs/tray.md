@@ -146,6 +146,13 @@ the quit event's reason says, it lets AppKit go on, as cancelling would stop
 that. Command-W closes the window into the menu bar, and Command-M minimizes
 it (`src/ui.rs`), in any keyboard layout, which winit's menu leaves out.
 
+The app menu, with Quit on Command-Q, is Slint's, which it makes as a window
+first becomes active; winit's own is off. Started at sign-in, with no window,
+the menu bar would show an empty app menu and Command-Q would do nothing, so
+when there's none yet the tray puts in one with the same items: About,
+Services, Hide, Hide Others, Show All and Quit. Slint's takes its place once a
+window shows, and stays after it closes.
+
 Starting at sign-in isn't there on macOS yet, so Settings doesn't show it.
 
 ## Testing

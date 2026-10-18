@@ -541,8 +541,8 @@ mod macos {
         sel,
     };
     use objc2_app_kit::{
-        NSApplication, NSApplicationTerminateReply, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-        NSStatusItem, NSVariableStatusItemLength,
+        NSApplication, NSApplicationTerminateReply, NSEventModifierFlags, NSImage, NSMenu,
+        NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
     };
     use objc2_foundation::{
         NSAppleEventDescriptor, NSAppleEventManager, NSData, NSObject, NSSize, NSString,
@@ -642,6 +642,7 @@ mod macos {
                 button.setToolTip(Some(&NSString::from_str("Yapfast")));
             }
             teach_delegate(mtm, chosen);
+            app_menu(mtm);
             Some(Self {
                 item,
                 disconnect,
@@ -774,6 +775,54 @@ mod macos {
             // has does nothing.
             unsafe { ffi::class_addMethod(class, selector, method, types.as_ptr().cast()) };
         }
+    }
+
+    /// Gives the menu bar Yapfast's app menu, with Quit, until Slint puts in
+    /// its own with the same items. Slint makes that as a window first becomes
+    /// active, so after starting at sign-in, with no window, the app menu was
+    /// empty and Command-Q did nothing.
+    fn app_menu(mtm: MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        if app.mainMenu().is_some() {
+            return;
+        }
+        let menu = NSMenu::new(mtm);
+        let entry = |title: &str, action: Option<Sel>, key: &str| {
+            // SAFETY: each action is NSApplication's own, which the menu
+            // reaches without a target.
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    action,
+                    &NSString::from_str(key),
+                )
+            };
+            menu.addItem(&item);
+            item
+        };
+        entry(
+            "About Yapfast",
+            Some(sel!(orderFrontStandardAboutPanel:)),
+            "",
+        );
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let services = NSMenu::new(mtm);
+        entry("Services", None, "").setSubmenu(Some(&services));
+        app.setServicesMenu(Some(&services));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        entry("Hide Yapfast", Some(sel!(hide:)), "h");
+        entry("Hide Others", Some(sel!(hideOtherApplications:)), "h").setKeyEquivalentModifierMask(
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+        );
+        entry("Show All", Some(sel!(unhideAllApplications:)), "");
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        entry("Quit Yapfast", Some(sel!(terminate:)), "q");
+        let bar = NSMenu::new(mtm);
+        let item = NSMenuItem::new(mtm);
+        item.setSubmenu(Some(&menu));
+        bar.addItem(&item);
+        app.setMainMenu(Some(&bar));
     }
 
     /// Whether the quit AppKit asks about is the Mac logging out, restarting
