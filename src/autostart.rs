@@ -32,19 +32,77 @@ pub fn set(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Points an entry that's on at this Yapfast once the program it names is
-/// gone, as after its folder moved; an update in place keeps the name. One
-/// naming a program that's there stays, so a copy run from a disk image or
-/// another build doesn't take it over, to name nothing once ejected or
-/// deleted. It only writes the entry, and never asks the person anything.
+/// Points an entry that's on at this Yapfast, as after an update to a new
+/// folder, as the Windows ZIP, an AppImage and Nix each give a version, or a
+/// move, or when it lacks this one's `--data-dir`. A copy run from a disk
+/// image or a temporary folder, or on the Mac a build outside an app, leaves
+/// it be, so as not to leave it naming nothing once that's gone. It only
+/// writes the entry, and never asks the person anything.
 pub fn refresh() {
-    if !enabled() || platform::program().is_some_and(|program| program.exists()) {
+    if !enabled() {
         return;
     }
-    match command().and_then(|command| platform::write(&command)) {
+    let command = match command() {
+        Ok(command) => command,
+        Err(error) => {
+            tracing::info!(%error, "starting at sign-in starts the Yapfast it named");
+            return;
+        }
+    };
+    if !takes_over(platform::recorded().as_deref(), &command) {
+        return;
+    }
+    match platform::write(&command) {
         Ok(()) => tracing::info!("starting at sign-in now starts this Yapfast"),
         Err(error) => tracing::warn!(%error, "could not update starting at sign-in"),
     }
+}
+
+/// Whether this Yapfast's `command` replaces the one the entry `recorded`:
+/// it's another, and this copy is an installed one.
+fn takes_over(recorded: Option<&[String]>, command: &[String]) -> bool {
+    recorded != Some(command) && installed(std::path::Path::new(&command[0]))
+}
+
+/// Whether `program` is an installed Yapfast, to start at sign-in in place of
+/// another: everywhere but the Mac, any that isn't somewhere temporary, which
+/// `command` refuses; on the Mac, the program inside an app, not a build run
+/// from its folder.
+fn installed(program: &std::path::Path) -> bool {
+    !cfg!(target_os = "macos") || in_app(program)
+}
+
+/// Whether `program` is an app's own, in `Something.app/Contents/MacOS`.
+fn in_app(program: &std::path::Path) -> bool {
+    program.parent().is_some_and(|folder| {
+        folder.ends_with("Contents/MacOS")
+            && folder
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::extension)
+                .is_some_and(|extension| extension == "app")
+    })
+}
+
+/// Why `program` can't be started at sign-in, if it runs from a place gone
+/// by then: Gatekeeper's temporary copy of a downloaded app that wasn't
+/// moved, a disk image on the Mac, or the temporary folder, where Windows
+/// runs a program opened inside a ZIP.
+fn temporary_place(program: &std::path::Path) -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        if program
+            .components()
+            .any(|part| part.as_os_str() == "AppTranslocation")
+        {
+            return Some("Yapfast runs from a temporary copy. Move it to Applications first.");
+        }
+        if program.starts_with("/Volumes") {
+            return Some("Yapfast runs from a disk image. Move it to Applications first.");
+        }
+    }
+    program
+        .starts_with(std::env::temp_dir())
+        .then_some("Yapfast runs from a temporary folder. Move it somewhere it stays first.")
 }
 
 /// What starts Yapfast in the tray, with the data folder this one uses.
@@ -59,16 +117,8 @@ fn command() -> std::io::Result<Vec<String>> {
         }
         _ => exe,
     };
-    // Gatekeeper runs a downloaded app that wasn't moved from a read-only
-    // copy in a random folder, which is gone by the next sign-in.
-    if cfg!(target_os = "macos")
-        && program
-            .components()
-            .any(|part| part.as_os_str() == "AppTranslocation")
-    {
-        return Err(std::io::Error::other(
-            "Yapfast runs from a temporary copy; move it to Applications first",
-        ));
+    if let Some(place) = temporary_place(&program) {
+        return Err(std::io::Error::other(place));
     }
     let mut command = vec![path_text(program)?, "--background".to_owned()];
     let arguments: Vec<String> = std::env::args().collect();
@@ -98,15 +148,45 @@ fn path_text(path: PathBuf) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// The program a Run value names: its first argument, quoted or not.
+/// A Run value's arguments, split as Windows splits a command line: quotes
+/// group, and backslashes count only before a quote, two for each one kept.
 #[cfg(any(windows, test))]
-fn windows_program(line: &str) -> Option<String> {
-    let line = line.trim_start();
-    let program = match line.strip_prefix('"') {
-        Some(rest) => &rest[..rest.find('"')?],
-        None => line.split([' ', '\t']).next()?,
-    };
-    (!program.is_empty()).then(|| program.to_owned())
+fn windows_arguments(line: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut argument = String::new();
+    let (mut started, mut quoted, mut backslashes) = (false, false, 0);
+    for character in line.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            started = true;
+            continue;
+        }
+        if character == '"' {
+            argument.extend(std::iter::repeat_n('\\', backslashes / 2));
+            match backslashes % 2 {
+                1 => argument.push('"'),
+                _ => quoted = !quoted,
+            }
+            started = true;
+        } else {
+            argument.extend(std::iter::repeat_n('\\', backslashes));
+            if matches!(character, ' ' | '\t') && !quoted {
+                if started {
+                    arguments.push(std::mem::take(&mut argument));
+                }
+                started = false;
+            } else {
+                argument.push(character);
+                started = true;
+            }
+        }
+        backslashes = 0;
+    }
+    argument.extend(std::iter::repeat_n('\\', backslashes));
+    if started {
+        arguments.push(argument);
+    }
+    arguments
 }
 
 /// One argument of a desktop entry's Exec line, quoted as the Desktop Entry
@@ -132,42 +212,50 @@ fn desktop_argument(argument: &str) -> String {
     quoted
 }
 
-/// The program an Exec line names, its first argument, as `desktop_argument`
-/// quotes it.
+/// An Exec line's arguments, as `desktop_argument` quotes them; `None` for
+/// one it couldn't have written.
 #[cfg(any(target_os = "linux", test))]
-fn desktop_program(exec: &str) -> Option<String> {
-    let exec = exec.trim_start();
-    let program = match exec.strip_prefix('"') {
-        Some(rest) => {
-            let mut program = String::new();
-            let mut characters = rest.chars();
+fn desktop_arguments(exec: &str) -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    let mut characters = exec.chars().peekable();
+    loop {
+        while characters.next_if_eq(&' ').is_some() {}
+        let Some(first) = characters.next() else {
+            return Some(arguments);
+        };
+        let mut argument = String::new();
+        if first == '"' {
             loop {
                 match characters.next()? {
-                    '"' => break program,
-                    '\\' => program.push(characters.next()?),
-                    character => program.push(character),
+                    '"' => break,
+                    '\\' => argument.push(characters.next()?),
+                    character => argument.push(character),
                 }
             }
+        } else {
+            argument.push(first);
+            while let Some(character) = characters.next_if(|&character| character != ' ') {
+                argument.push(character);
+            }
         }
-        None => exec.split(' ').next()?.to_owned(),
-    };
-    let program = program.replace("%%", "%");
-    (!program.is_empty()).then_some(program)
+        arguments.push(argument.replace("%%", "%"));
+    }
 }
 
-/// The program an agent runs, the first of its arguments, as `launch_agent`
-/// writes it.
+/// An agent's arguments, as `launch_agent` writes them.
 #[cfg(any(target_os = "macos", test))]
-fn agent_program(agent: &str) -> Option<String> {
+fn agent_arguments(agent: &str) -> Option<Vec<String>> {
     let (_, arguments) = agent.split_once("<key>ProgramArguments</key>")?;
-    let (_, first) = arguments.split_once("<string>")?;
-    let (program, _) = first.split_once("</string>")?;
-    Some(
-        program
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
+    let (arguments, _) = arguments.split_once("</array>")?;
+    let arguments = arguments.split("<string>").skip(1).map(|argument| {
+        let (text, _) = argument.split_once("</string>")?;
+        Some(
+            text.replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        )
+    });
+    arguments.collect()
 }
 
 /// Writes `text` to `path` whole or not at all, so launchd or a desktop
@@ -302,14 +390,14 @@ mod linux {
         }
     }
 
-    pub fn program() -> Option<PathBuf> {
-        entry_program(&config()?)
+    pub fn recorded() -> Option<Vec<String>> {
+        entry_command(&config()?)
     }
 
-    pub(super) fn entry_program(config: &Path) -> Option<PathBuf> {
+    pub(super) fn entry_command(config: &Path) -> Option<Vec<String>> {
         let entry = std::fs::read_to_string(entry(config)).ok()?;
         let exec = entry.lines().find_map(|line| line.strip_prefix("Exec="))?;
-        super::desktop_program(exec).map(PathBuf::from)
+        super::desktop_arguments(exec)
     }
 
     /// `$XDG_CONFIG_HOME`, or `~/.config`.
@@ -375,10 +463,7 @@ mod linux {
                 r#"Exec="/opt/Yapfast Builds/yapfast" --background --data-dir "/home/a/100%% \$data""#
             ));
             assert!(text.contains("Name=Yapfast\n"));
-            assert_eq!(
-                entry_program(config.path()),
-                Some(PathBuf::from("/opt/Yapfast Builds/yapfast"))
-            );
+            assert_eq!(entry_command(config.path()).as_deref(), Some(&command[..]));
         }
 
         #[test]
@@ -446,14 +531,14 @@ mod windows {
         delete(APPROVED)
     }
 
-    pub fn program() -> Option<std::path::PathBuf> {
+    pub fn recorded() -> Option<Vec<String>> {
         let value = query(RUN, RRF_RT_REG_SZ)?;
         let line: Vec<u16> = value
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .take_while(|&unit| unit != 0)
             .collect();
-        super::windows_program(&String::from_utf16_lossy(&line)).map(Into::into)
+        Some(super::windows_arguments(&String::from_utf16_lossy(&line)))
     }
 
     fn delete(key: &str) -> io::Result<()> {
@@ -625,9 +710,9 @@ mod macos {
         Ok(())
     }
 
-    pub fn program() -> Option<PathBuf> {
+    pub fn recorded() -> Option<Vec<String>> {
         let agent = std::fs::read_to_string(entry(&agents()?)).ok()?;
-        super::agent_program(&agent).map(PathBuf::from)
+        super::agent_arguments(&agent)
     }
 
     pub fn remove() -> io::Result<()> {
@@ -738,8 +823,8 @@ mod macos {
             assert_eq!(agent["LimitLoadToSessionType"], json!("Aqua"));
             let text = std::fs::read_to_string(entry(agents.path())).unwrap();
             assert_eq!(
-                super::super::agent_program(&text).as_ref(),
-                Some(&command[0])
+                super::super::agent_arguments(&text).as_deref(),
+                Some(&command[..])
             );
             assert!(!write_entry(agents.path(), &command).unwrap(), "it's right");
         }
@@ -751,24 +836,18 @@ mod macos {
         fn turns_on_and_off_as_system_settings_sees_it() {
             remove().unwrap();
             assert!(!enabled());
-            let gone = "/Applications/Gone/Yapfast.app/Contents/MacOS/yapfast";
-            write(&[gone.into(), "--background".into()]).unwrap();
+            let gone = [
+                "/Applications/Gone/Yapfast.app/Contents/MacOS/yapfast",
+                "--background",
+            ]
+            .map(String::from);
+            write(&gone).unwrap();
             assert!(enabled(), "macOS has it on, though its program is gone");
-            // A start points an entry whose program is gone at this Yapfast.
+            assert_eq!(recorded().as_deref(), Some(&gone[..]));
+            // A build outside an app, as this test is, leaves it be.
             super::super::refresh();
-            let program = std::env::current_exe().unwrap();
-            let program = program.to_string_lossy();
             let agents = agents().unwrap();
-            assert_eq!(
-                read(&agents)["ProgramArguments"],
-                json!([program, "--background"])
-            );
-            // One whose program is there stays, as for another copy's.
-            let other = [&*program, "--background", "--data-dir", "/elsewhere"];
-            write(&other.map(String::from)).unwrap();
-            super::super::refresh();
-            assert_eq!(read(&agents)["ProgramArguments"], json!(other));
-            assert!(enabled());
+            assert_eq!(read(&agents)["ProgramArguments"], json!(gone));
             remove().unwrap();
             assert!(!enabled());
             assert!(!entry(&agents).exists());
@@ -792,43 +871,102 @@ mod none {
         Ok(())
     }
 
-    pub fn program() -> Option<std::path::PathBuf> {
+    pub fn recorded() -> Option<Vec<String>> {
         None
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
-    fn reads_back_the_program_each_entry_names() {
+    fn reads_back_the_command_each_entry_holds() {
         let command = [
-            "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast".to_owned(),
-            "--background".to_owned(),
+            "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast",
+            "--background",
+            "--data-dir",
+            "/Users/a/<data>",
+        ]
+        .map(String::from);
+        assert_eq!(
+            agent_arguments(&launch_agent(&command)).as_deref(),
+            Some(&command[..])
+        );
+        let command = [
+            "/opt/Yapfast Builds/100% \"yap\" $fast",
+            "--background",
+            "--data-dir",
+            r"/home/a/back\slash",
+            "",
+        ]
+        .map(String::from);
+        let exec: Vec<String> = command.iter().map(|it| desktop_argument(it)).collect();
+        assert_eq!(
+            desktop_arguments(&exec.join(" ")).as_deref(),
+            Some(&command[..])
+        );
+        assert_eq!(desktop_arguments(r#""unclosed"#), None);
+        let command = [
+            r"C:\Program Files\Yapfast\yapfast.exe",
+            "--background",
+            "--data-dir",
+            r"C:\A B\",
+            r#"say "hi""#,
+            "",
         ];
+        let line = command.map(windows_argument).join(" ");
+        assert_eq!(windows_arguments(&line), command, "{line}");
+        // As the installer writes it.
         assert_eq!(
-            agent_program(&launch_agent(&command)).as_ref(),
-            Some(&command[0])
+            windows_arguments(r#""C:\Users\A\Programs\Yapfast\yapfast.exe" --background"#),
+            [r"C:\Users\A\Programs\Yapfast\yapfast.exe", "--background"]
         );
-        for program in ["/opt/Yapfast Builds/100% \"yap\" $fast", "/usr/bin/yapfast"] {
-            let exec = format!("{} --background", desktop_argument(program));
-            assert_eq!(desktop_program(&exec).as_deref(), Some(program), "{exec}");
-        }
-        let line = format!(
-            "{} --background",
-            windows_argument(r"C:\Program Files\Yapfast\yapfast.exe")
-        );
-        assert_eq!(
-            windows_program(&line).as_deref(),
-            Some(r"C:\Program Files\Yapfast\yapfast.exe")
-        );
-        assert_eq!(
-            windows_program(r"C:\Yapfast\yapfast.exe --background").as_deref(),
-            Some(r"C:\Yapfast\yapfast.exe")
-        );
-        assert_eq!(windows_program(""), None);
-        assert_eq!(desktop_program(r#""unclosed"#), None);
+    }
+
+    #[test]
+    fn an_installed_copy_takes_over_an_entry_that_starts_another() {
+        let new = [
+            if cfg!(target_os = "macos") {
+                "/Applications/Yapfast.app/Contents/MacOS/yapfast"
+            } else {
+                "/opt/yapfast-1.1/yapfast"
+            },
+            "--background",
+        ]
+        .map(String::from);
+        let old = ["/opt/yapfast-1.0/yapfast", "--background"].map(String::from);
+        assert!(takes_over(Some(&old), &new), "an update to a new folder");
+        assert!(!takes_over(Some(&new), &new));
+        let mut with_data = new.to_vec();
+        with_data.extend(["--data-dir".to_owned(), "/data".to_owned()]);
+        assert!(takes_over(Some(&new), &with_data), "this one's data folder");
+        assert!(takes_over(None, &new), "an entry it can't read");
+        assert!(in_app(Path::new(
+            "/Applications/Yapfast.app/Contents/MacOS/yapfast"
+        )));
+        assert!(!in_app(Path::new("/Users/a/yapfast/target/fast/yapfast")));
+    }
+
+    #[test]
+    fn a_copy_in_the_temporary_folder_cant_be_started_at_sign_in() {
+        let zip = std::env::temp_dir().join("Temp1_Yapfast.zip");
+        assert!(temporary_place(&zip.join("yapfast.exe")).is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_image_or_a_build_outside_an_app_doesnt_take_it_over() {
+        let app = "Yapfast.app/Contents/MacOS/yapfast";
+        let image = Path::new("/Volumes/Yapfast").join(app);
+        assert!(temporary_place(&image).is_some());
+        let translocated = Path::new("/private/var/folders/x/AppTranslocation/1/d").join(app);
+        assert!(temporary_place(&translocated).is_some());
+        assert!(temporary_place(&Path::new("/Applications").join(app)).is_none());
+        let build = ["/Users/a/yapfast/target/fast/yapfast".to_owned()];
+        assert!(!takes_over(None, &build));
     }
 
     #[test]
