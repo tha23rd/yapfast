@@ -517,12 +517,16 @@ static int feed(struct yapfast_video *video) {
         if (skip && marked >= 8) {
           video->aac_skip = skip[0] | skip[1] << 8 | skip[2] << 16 | (uint32_t)skip[3] << 24;
           back = skip[4] | skip[5] << 8 | skip[6] << 16 | (uint32_t)skip[7] << 24;
+          /* FFmpeg reads the priming as a signed count, so a mark of 2^31 or
+           * more leaves none out, rather than all the sound. */
+          if (video->aac_skip > INT32_MAX) video->aac_skip = 0;
         }
         uint32_t front = video->aac_skip < (uint32_t)frames ? video->aac_skip : (uint32_t)frames;
         video->aac_skip -= front;
         int start = packet->flags & AV_PKT_FLAG_DISCARD ? frames : (int)front;
         frames -= start;
-        frames -= back < (uint32_t)frames ? (int)back : frames;
+        /* Padding longer than what's left is a mark FFmpeg ignores. */
+        if (back <= (uint32_t)frames) frames -= (int)back;
         if (frames > 0) video->aac_samples += (size_t)start * (size_t)video->channels;
         video->aac_frames = frames;
         video->aac_time =

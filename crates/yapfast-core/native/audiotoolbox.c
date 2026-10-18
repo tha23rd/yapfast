@@ -15,13 +15,27 @@ enum { GIVEN = 1 };
  * band replication doubling the rate. */
 enum { MOST_FRAMES = 4096 };
 
-/* AAC puts the centre first, as AudioToolbox gives it; FFmpeg's decoder,
- * whose order the rest of Yapfast takes, puts left and right first, then
- * the centre, the LFE and the surrounds. */
-static const AudioChannelLayoutTag LAYOUTS[9] = {
-    [3] = kAudioChannelLayoutTag_MPEG_3_0_A, [4] = kAudioChannelLayoutTag_MPEG_4_0_A,
-    [5] = kAudioChannelLayoutTag_MPEG_5_0_A, [6] = kAudioChannelLayoutTag_MPEG_5_1_A,
-    [8] = kAudioChannelLayoutTag_MPEG_7_1_A,
+/* AAC's layouts, centre first, as AudioToolbox gives them, and the same
+ * channels in the order of FFmpeg's decoder, which the rest of Yapfast takes:
+ * left and right, the centre, the LFE, then the surrounds, rear ones before
+ * side ones, and those above last. */
+static const AudioChannelLayoutTag ORDERS[][2] = {
+    {kAudioChannelLayoutTag_AAC_3_0, kAudioChannelLayoutTag_MPEG_3_0_A},
+    {kAudioChannelLayoutTag_AAC_4_0, kAudioChannelLayoutTag_MPEG_4_0_A},
+    {kAudioChannelLayoutTag_AAC_5_0, kAudioChannelLayoutTag_MPEG_5_0_A},
+    {kAudioChannelLayoutTag_AAC_5_1, kAudioChannelLayoutTag_MPEG_5_1_A},
+    {kAudioChannelLayoutTag_AAC_6_1, kAudioChannelLayoutTag_MPEG_6_1_A},
+    {kAudioChannelLayoutTag_AAC_7_1_B, kAudioChannelLayoutTag_WAVE_7_1},
+    {kAudioChannelLayoutTag_AAC_7_1_C, kAudioChannelLayoutTag_CICP_14},
+};
+/* AAC's other 7.1, channel configuration 7, which FFmpeg's encoder writes:
+ * FFmpeg's decoder takes its first pair of fronts as left and right and its
+ * outer pair as the sides, after the rear, an order no layout tag has. */
+static const AudioChannelLabel WIDE[8] = {
+    kAudioChannelLabel_LeftCenter,   kAudioChannelLabel_RightCenter,
+    kAudioChannelLabel_Center,       kAudioChannelLabel_LFEScreen,
+    kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround,
+    kAudioChannelLabel_Left,         kAudioChannelLabel_Right,
 };
 
 struct yapfast_aac {
@@ -112,11 +126,32 @@ struct yapfast_aac *yapfast_aac_new(const uint8_t *config, size_t config_size, i
     yapfast_aac_free(aac);
     return NULL;
   }
-  /* A converter that won't reorder still plays, in AAC's order. */
-  AudioChannelLayout layout = {.mChannelLayoutTag = LAYOUTS[in.mChannelsPerFrame]};
-  if (layout.mChannelLayoutTag) {
-    AudioConverterSetProperty(aac->converter, kAudioConverterOutputChannelLayout, sizeof layout,
-                              &layout);
+  /* Surround in FFmpeg's order, from the layout the stream has; one the
+   * converter won't reorder still plays, in AAC's. */
+  AudioChannelLayout layout = {0};
+  UInt32 layout_size = sizeof layout;
+  if (!AudioConverterGetProperty(aac->converter, kAudioConverterOutputChannelLayout, &layout_size,
+                                 &layout)) {
+    size_t wide_size = sizeof(AudioChannelLayout) + 7 * sizeof(AudioChannelDescription);
+    AudioChannelLayout *wide =
+        layout.mChannelLayoutTag == kAudioChannelLayoutTag_AAC_7_1 ? calloc(1, wide_size) : NULL;
+    if (wide) {
+      wide->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+      wide->mNumberChannelDescriptions = 8;
+      for (int index = 0; index < 8; index++) {
+        wide->mChannelDescriptions[index].mChannelLabel = WIDE[index];
+      }
+      AudioConverterSetProperty(aac->converter, kAudioConverterOutputChannelLayout,
+                                (UInt32)wide_size, wide);
+      free(wide);
+    }
+    for (size_t index = 0; index < sizeof ORDERS / sizeof *ORDERS; index++) {
+      if (layout.mChannelLayoutTag != ORDERS[index][0]) continue;
+      layout = (AudioChannelLayout){.mChannelLayoutTag = ORDERS[index][1]};
+      AudioConverterSetProperty(aac->converter, kAudioConverterOutputChannelLayout, sizeof layout,
+                                &layout);
+      break;
+    }
   }
   *rate = (int)in.mSampleRate;
   *channels = aac->channels;
