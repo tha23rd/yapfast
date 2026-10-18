@@ -9,12 +9,22 @@ on:
     inputs:
       flavour:
         description: "discord (the release) or full (with Matrix)"
+        type: choice
+        options: [discord, full]
         default: discord
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      # A tag such as v0.2.0-full-preview is the full preview; any other is
+      # the release.
+      FLAVOUR: ${{ inputs.flavour || (endsWith(github.ref_name, '-full-preview') && 'full' || 'discord') }}
+    # No cache: a tag's run restores only caches saved by its own tag or by
+    # the default branch, which runs this only when dispatched there, so a
+    # cache of the build, 2.3 GB of the repository's 10 GB, would serve
+    # hardly a run. It also brought back the disk images of earlier versions.
     steps:
       - uses: actions/checkout@v4
       - name: Tools
@@ -22,28 +32,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            .local/macos
-          key: macos-${{ inputs.flavour || 'discord' }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: macos-${{ inputs.flavour || 'discord' }}-
+      # macOS's own bash, 3.2, as on a Mac.
       - name: Build and package
-        run: scripts/build-macos ${{ inputs.flavour || 'discord' }}
+        run: /bin/bash scripts/build-macos "$FLAVOUR"
       - name: Check the package
         run: |
-          image=$(ls target/dist/macos/*.dmg)
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "yapfast"))')
+          suffix=
+          if [[ $FLAVOUR == full ]]; then suffix=-full-preview; fi
+          image=target/dist/macos/Yapfast-$version$suffix-macos-arm64.dmg
           mount=$(mktemp -d)
           hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$image"
           codesign --verify --strict "$mount/Yapfast.app"
+          codesign -d -r- "$mount/Yapfast.app" 2>&1 | grep -F 'designated => identifier "io.github.yapfast.Yapfast"'
           "$mount/Yapfast.app/Contents/MacOS/yapfast" --smoke-test
           hdiutil detach -quiet "$mount"
       - uses: actions/upload-artifact@v4
         with:
-          name: yapfast-macos-arm64-${{ inputs.flavour || 'discord' }}
+          name: yapfast-macos-arm64-${{ env.FLAVOUR }}
           path: target/dist/macos/
           if-no-files-found: error

@@ -73,6 +73,14 @@ meets it too, and so gets the microphone and the Discord token without
 asking. A Developer ID signature would add its certificate to the
 requirement.
 
+`.github/workflows/macos.yml` runs `scripts/build-macos`, with macOS's own
+bash, on GitHub's Apple silicon runner: for each `v*` tag, the full preview
+for one ending `-full-preview`, and when dispatched, in the flavour chosen.
+It checks the disk image's signature and runs `--smoke-test` from it, and
+keeps the disk image, the snapshot and `SHA256SUMS.txt` with the run. It
+caches nothing, as a tag's run restores only caches its own tag or the
+default branch saved.
+
 A development build needs only `PROTOC`: Skia's and LiveKit's build scripts
 download their archives themselves.
 
