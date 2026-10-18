@@ -40,7 +40,14 @@ def names_home(contents):
 def source_snapshot(metadata, base, temporary, destination):
     """Zips the repository's tracked source to destination, with the exact
     upstream RTC source the AGPL dependencies came from when the build has
-    them. Returns whether it does."""
+    them. Returns whether it does. Refuses a tree with changes not committed,
+    which the snapshot would leave out or fail to copy."""
+    changes = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", *SOURCE_FILES, *SOURCE_DIRECTORIES],
+        cwd=ROOT, text=True, timeout=30)
+    if changes:
+        raise SystemExit("The source snapshot is the commit's source, but these files differ from it; "
+                         "commit them, or set them aside, and package again:\n" + changes)
     source = temporary / f"{base}-source"
     source.mkdir()
     # Only what the repository tracks: the folders also hold private,

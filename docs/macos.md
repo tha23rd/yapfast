@@ -45,7 +45,10 @@ and runs `scripts/package-macos.py`. That puts `Yapfast.app` together:
 `Contents/MacOS/yapfast`, `Info.plist` with the version filled in,
 `Yapfast.icns`, and in `Resources` the licenses and notices,
 `THIRD-PARTY.json`, `SOURCE.txt` and `BUILD.json`, as the Windows ZIP has
-them. Skia's prebuilt archive carries only its own license, so the notices of
+them; here `BUILD.json` also names the commit. The source snapshot is that
+commit's source, so packaging refuses a tree with changes not committed, or
+files Git doesn't know yet, in the snapshot's folders. Skia's prebuilt
+archive carries only its own license, so the notices of
 its third-party code come from the pinned Skia source and the dependencies
 `nix/flake.nix` names, fetched once into `.local/macos/skia-source`, Git
 checking out the same commits Nix pins. It signs the app ad hoc, which Apple

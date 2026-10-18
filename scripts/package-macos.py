@@ -146,6 +146,8 @@ def main():
             "version": version, "flavour": args.flavour, "target": TARGET,
             "cargo_features": " ".join(flavour["features"]) or "default",
             "rustc": subprocess.check_output(["rustc", "--version"], text=True, timeout=10).strip(),
+            "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+                                                     timeout=10).strip(),
             "macos_minimum": "11.0",
             "signature": "ad hoc",
             "ui_framework": "Slint 1.18.1",

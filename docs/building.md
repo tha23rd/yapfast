@@ -336,6 +336,11 @@ folders into the binary; the [AppImage](#linux-appimage) avoids both by
 building in the Nix sandbox.
 GPUI's FXC shader build is no longer used.
 
+Each release's source snapshot is the commit's source, the files Git tracks
+in the folders `scripts/release_package.py` names. So packaging, on every
+platform, refuses a tree with changes not committed there, or files Git
+doesn't know yet, which the snapshot would leave out or fail to copy.
+
 The supported build route for this migration is the Linux MSVC cross-build.
 Native Windows development needs Rustup, Visual Studio C++ tools and SDK, CMake,
 LLVM and Protobuf, plus the same prepared Skia archive through
