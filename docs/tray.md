@@ -120,6 +120,25 @@ since it writes the current user's Run key, passes with a throwaway
 `WINEPREFIX`, and the installer installs, updates over Task Manager's "off",
 and uninstalls under `xvfb-run` in one, leaving the data folder.
 
+## macOS
+
+The icon is an `NSStatusItem` in the menu bar, through the objc2 AppKit
+bindings winit already builds, made on the UI thread, whose run loop winit
+runs. As Mac menu bar icons do, a click shows the menu; its items call a small
+Objective-C class, `YapfastTrayTarget`, which hands the choice to Slint's event
+loop. The menu bar always takes the icon, so closing goes to it.
+
+A Mac app with its window closed keeps its Dock icon, and clicking that should
+bring the window back. AppKit asks the application delegate,
+`applicationShouldHandleReopen:hasVisibleWindows:`, and winit's delegate
+doesn't answer, so Yapfast adds that method to winit's class when the tray
+starts: with no window showing, it opens one, as Open Yapfast does. Command-Q
+quits from the app menu, as everywhere on the Mac; Command-W closes the window
+into the menu bar, and Command-M minimizes it (`src/ui.rs`), which winit's
+menu leaves out.
+
+Starting at sign-in isn't there on macOS yet, so Settings doesn't show it.
+
 ## Testing
 
 `scripts/ui-session start --tray` runs `testing/tray_host.rs`, a minimal

@@ -119,8 +119,21 @@ It compiles from source, so give it a few minutes. No Nix? Then
 
 ### macOS
 
-Not yet, sorry :( I'd love to make one, but I don't own an Apple machine to
-test it on.
+For Macs with Apple silicon (M1 and newer), on macOS 11 or later.
+
+1. Download `Yapfast-…-macos-arm64.dmg` from the
+   [latest release](https://github.com/yapfast/yapfast/releases/latest), open
+   it, and drag Yapfast onto Applications.
+2. Open Yapfast. It isn't notarized by Apple yet, so the first time macOS
+   refuses: open **System Settings → Privacy & Security**, scroll down to the
+   note about Yapfast, and choose **Open Anyway**.
+3. Link your account with the QR code, as on Windows. macOS asks once for the
+   microphone when you first join a voice channel, and once for notifications.
+
+Closing the window keeps Yapfast in the menu bar, so messages and calls still
+reach you; click its icon there, or Yapfast in the Dock, to bring it back.
+Cameras, sharing your apps' sound with Go Live, starting at login and Intel
+Macs aren't covered yet.
 
 ## Features
 
@@ -232,6 +245,9 @@ nix develop path:./nix --command cargo run --locked --no-default-features --feat
 # Windows installer and ZIP, cross-built from Linux, into target/dist
 nix develop path:./nix#windows --command scripts/build-windows
 
+# The Mac's disk image, on a Mac, into target/dist/macos
+scripts/build-macos
+
 # Format, lint and test everything
 scripts/check --fast
 ```
@@ -244,6 +260,7 @@ scripts/check --fast
 | [Discord](docs/discord.md) | What's done, what's next, and the fake server the tests use |
 | [Voice](docs/voice.md) | Calls, devices and audio processing |
 | [Windows](docs/windows-beta.md) | Packaging, the installer and Windows checks |
+| [macOS](docs/macos.md) | The Mac build, its disk image and macOS checks |
 | [Measurements](docs/measurements/README.md) | How memory and CPU are measured |
 
 Memory is a product goal. Keep every change lean, and give the numbers you

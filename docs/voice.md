@@ -201,7 +201,7 @@ The input menu's level meter reads the chosen microphone locally through
 works while muted, outside calls and in the preview, and it never touches the
 call: muted, nothing is published or sent. It shows as "Input level" in the
 system's recording streams on Linux. On Windows it reads the microphone
-through WASAPI.
+through WASAPI, and on macOS through an audio queue.
 
 ## Run the local demo
 

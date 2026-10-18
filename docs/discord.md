@@ -191,9 +191,10 @@ as Matrix voice. Calls start with the microphone on unless Settings turns
 that off, mute and deafen show in Discord, and a
 voice gate sends audio only during speech. The owner and a friend talked
 through it on 2026-10-06. Audio goes through `audio_io.rs`, PulseAudio on
-Linux and WASAPI on Windows, and libwebrtc's processing module; see the
-[Windows guide](windows-beta.md#discord-voice-on-windows) for what's been
-checked there. davey's change for Go Live groups is described in
+Linux, WASAPI on Windows and Audio Queue Services on macOS, and libwebrtc's
+processing module; see the
+[Windows guide](windows-beta.md#discord-voice-on-windows) and the
+[macOS guide](macos.md#sound) for what's been checked there. davey's change for Go Live groups is described in
 `vendor/davey/README.yapfast.md`.
 
 Discord may move a call to another voice server, saying so with a new
