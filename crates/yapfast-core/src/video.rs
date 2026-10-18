@@ -489,4 +489,63 @@ mod tests {
         assert_eq!(silent.sound, None);
         assert_eq!(timeline(&mut silent).1, Vec::<u64>::new());
     }
+
+    #[test]
+    fn leaves_out_what_an_edit_list_cuts() {
+        // Half a second cut from the front without encoding again: the
+        // pictures and sound before the cut stay in the file, for what comes
+        // after to decode from, but don't play. FFmpeg's decoders give these.
+        let data = fixture("video-cut.mp4");
+        let mut video = Video::open(std::io::Cursor::new(&data[..]), true).unwrap();
+        assert_eq!(video.sound, Some((8000, 6)));
+        let (pictures, sounds, samples) = timeline(&mut video);
+        assert_eq!(
+            pictures,
+            (0..25).map(|index| index * 40).collect::<Vec<_>>()
+        );
+        assert_eq!(sounds.first(), Some(&0));
+        assert_eq!(samples, 8288);
+    }
+
+    #[test]
+    fn surround_comes_left_and_right_first() {
+        // Each channel is louder than the one before but the LFE, which is
+        // silent, in FFmpeg's order: left, right, centre, LFE, the surrounds.
+        let data = fixture("video-cut.mp4");
+        let mut video = Video::open(std::io::Cursor::new(&data[..]), true).unwrap();
+        let mut power = [0.0; 6];
+        loop {
+            match video.decode().unwrap() {
+                Next::Sound(_) => {
+                    for frame in video.sound().samples.chunks_exact(6) {
+                        for (sum, sample) in power.iter_mut().zip(frame) {
+                            *sum += sample * sample;
+                        }
+                    }
+                }
+                Next::Picture(_) => {}
+                Next::End => break,
+            }
+        }
+        assert!(power[3] < power[0] / 100.0, "{power:?}");
+        assert!(
+            [0, 1, 2, 4, 5]
+                .windows(2)
+                .all(|pair| power[pair[0]] < power[pair[1]]),
+            "{power:?}"
+        );
+    }
+
+    #[test]
+    fn reorders_pictures_by_what_the_stream_says() {
+        // Matroska doesn't say how far B-frames reorder pictures; H264's
+        // sequence parameter set does.
+        let data = fixture("video-reordered.mkv");
+        let mut video = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
+        let (pictures, _, _) = timeline(&mut video);
+        assert_eq!(
+            pictures,
+            (0..38).map(|index| index * 40).collect::<Vec<_>>()
+        );
+    }
 }

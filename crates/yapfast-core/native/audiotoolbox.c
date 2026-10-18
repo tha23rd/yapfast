@@ -15,6 +15,15 @@ enum { GIVEN = 1 };
  * band replication doubling the rate. */
 enum { MOST_FRAMES = 4096 };
 
+/* AAC puts the centre first, as AudioToolbox gives it; FFmpeg's decoder,
+ * whose order the rest of Yapfast takes, puts left and right first, then
+ * the centre, the LFE and the surrounds. */
+static const AudioChannelLayoutTag LAYOUTS[9] = {
+    [3] = kAudioChannelLayoutTag_MPEG_3_0_A, [4] = kAudioChannelLayoutTag_MPEG_4_0_A,
+    [5] = kAudioChannelLayoutTag_MPEG_5_0_A, [6] = kAudioChannelLayoutTag_MPEG_5_1_A,
+    [8] = kAudioChannelLayoutTag_MPEG_7_1_A,
+};
+
 struct yapfast_aac {
   AudioConverterRef converter;
   int channels;
@@ -102,6 +111,12 @@ struct yapfast_aac *yapfast_aac_new(const uint8_t *config, size_t config_size, i
                                 cookie_size, cookie)) {
     yapfast_aac_free(aac);
     return NULL;
+  }
+  /* A converter that won't reorder still plays, in AAC's order. */
+  AudioChannelLayout layout = {.mChannelLayoutTag = LAYOUTS[in.mChannelsPerFrame]};
+  if (layout.mChannelLayoutTag) {
+    AudioConverterSetProperty(aac->converter, kAudioConverterOutputChannelLayout, sizeof layout,
+                              &layout);
   }
   *rate = (int)in.mSampleRate;
   *channels = aac->channels;

@@ -94,17 +94,37 @@ decodes those through the system instead, where FFmpeg has no decoder:
 - `native/videotoolbox.c` decodes H264 with a VideoToolbox session, on the
   hardware decoder, synchronously on the caller's thread. An MP4 file's avcC
   box gives it the parameter sets; a Go Live stream's come in its Annex B
-  access units, which it rewrites with lengths, starting a new session when
-  they change. VideoToolbox gives pictures in decode order, so it holds back
-  as many as the demuxer says B-frames reorder by (`video_delay`) and gives
-  them by presentation time. libyuv makes its NV12 the I420 `video.c` and
+  access units, which it rewrites with lengths. It keeps the sets by kind and
+  id, and starts a new session when one changes, whether in the stream, in an
+  MP4 file's samples or in a new sample description; after a seek, so the
+  pictures after the keyframe can't refer to any from before; and when
+  VideoToolbox says the session stopped working, as after the Mac sleeps,
+  decoding the access unit again. VideoToolbox gives pictures in decode
+  order, so it holds back as many as B-frames reorder by and gives them by
+  presentation time: as many as MP4's demuxer counts (`video_delay`), or for
+  another file, as a Matroska or a fragmented MP4 one, as many as the
+  sequence parameter set's VUI says, none for the Baseline profile, and two
+  when it doesn't say. A picture that comes after a later one has shown is
+  left out and one more is held back from then on. The pictures an MP4 edit
+  list cuts, as from a trimmed iPhone clip, are decoded for the ones that
+  refer to them but don't show. libyuv makes its NV12 the I420 `video.c` and
   `decode.c` take, the range from the pixel format and the matrix from the
   buffer's attachment.
 - `native/audiotoolbox.c` decodes AAC with an `AudioConverter`, taking the
   AudioSpecificConfig wrapped in an ES descriptor, as FFmpeg's own
   AudioToolbox decoder does, and the richest format it describes, so HE-AAC
-  comes out at its full rate. `video.c` trims the encoder's priming and
-  padding by the demuxer's skip-samples marks, as FFmpeg's decoders do.
+  comes out at its full rate. Surround comes out in FFmpeg's order, left and
+  right first, by the output channel layout it asks for, rather than AAC's,
+  centre first. The converter gives each packet's samples as it takes the
+  packet, from the first: the onset of a tone half a second in lands on the
+  same sample as with FFmpeg's decoder. `video.c` trims the encoder's priming
+  and padding by the demuxer's skip-samples marks, counting the priming down
+  across packets, and decodes but leaves out the packets an edit list cuts,
+  as FFmpeg's decoders do.
+- A frame that doesn't decode, as after a frame lost, makes `decode.c` say so:
+  VideoToolbox fails every one after a lost reference until the next
+  keyframe, which watching a stream then asks for. A camera's decoder goes on
+  to that keyframe.
 
 VP8, VP9 and AV1 go through libvpx and dav1d from the archive, as elsewhere,
 and the favourite GIFs' VP9 clips with them.

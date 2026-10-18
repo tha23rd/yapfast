@@ -129,7 +129,7 @@ int yapfast_decoder_decode(struct yapfast_decoder *decoder, const unsigned char 
   }
 #ifdef __APPLE__
   if (decoder->vt) {
-    if (yapfast_vt_send(decoder->vt, data, size, YAPFAST_VT_NO_TIME) < 0) return -1;
+    if (yapfast_vt_send(decoder->vt, data, size, YAPFAST_VT_NO_TIME, 0) < 0) return -1;
     struct yapfast_vt_picture decoded;
     int got = yapfast_vt_receive(decoder->vt, &decoded);
     if (got <= 0) return got;

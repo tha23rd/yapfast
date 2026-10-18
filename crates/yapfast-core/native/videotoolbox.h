@@ -26,18 +26,26 @@ struct yapfast_vt_picture {
  * is its NAL units after their lengths, as MP4 keeps them; without, or with
  * parameter sets in Annex B form, each is NAL units after start codes, with
  * parameter sets coming in the stream. `delay` pictures are held back, so they
- * come out in the order they show, however B-frames reorder them. NULL when
- * the record's parameter sets can't be decoded. */
+ * come out in the order they show, however B-frames reorder them; with -1, as
+ * many as the stream's sequence parameter set says. NULL when the record's
+ * parameter sets can't be decoded. */
 struct yapfast_vt *yapfast_vt_new(const uint8_t *record, size_t record_size, int delay);
 void yapfast_vt_free(struct yapfast_vt *vt);
-/* Decodes an access unit that shows at `time`. 0, or a negative number when
+/* Takes new parameter sets, an avcC box or NAL units after start codes, as a
+ * file gives when they change; the next access unit decodes with them. -1
+ * without memory or with a damaged box. */
+int yapfast_vt_configure(struct yapfast_vt *vt, const uint8_t *record, size_t record_size);
+/* Decodes an access unit that shows at `time`. With `cut`, its picture is
+ * decoded for the ones that refer to it but never comes out, as for the
+ * pictures an MP4 file's edit list leaves out. 0, or a negative number when
  * it couldn't be decoded; later ones may be. */
-int yapfast_vt_send(struct yapfast_vt *vt, const uint8_t *data, size_t size, int64_t time);
+int yapfast_vt_send(struct yapfast_vt *vt, const uint8_t *data, size_t size, int64_t time,
+                    int cut);
 /* Takes the next picture in the order they show: 1 with one, 0 with none yet. */
 int yapfast_vt_receive(struct yapfast_vt *vt, struct yapfast_vt_picture *picture);
 /* No more access units come: the pictures held back come out. */
 void yapfast_vt_drain(struct yapfast_vt *vt);
-/* Drops the pictures held back, as after seeking. */
+/* Drops the pictures held back and what they referred to, as after seeking. */
 void yapfast_vt_flush(struct yapfast_vt *vt);
 
 #endif

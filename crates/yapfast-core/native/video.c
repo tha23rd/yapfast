@@ -15,6 +15,7 @@
 #include "dav1d/dav1d.h"
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
+#include "libavutil/avstring.h"
 #include "libyuv/convert_argb.h"
 #include "libyuv/scale.h"
 #include "vpx/vp8dx.h"
@@ -86,11 +87,13 @@ struct yapfast_video {
   struct planes planes;
   int sound_stream;
   AVCodecContext *sound_context;
-  /* AAC on macOS, and what its last packet decoded to and when, until taken. */
+  /* AAC on macOS, and what its last packet decoded to and when, until taken;
+   * and the encoder's priming still to leave out. */
   struct yapfast_aac *aac;
   const float *aac_samples;
   int aac_frames;
   int64_t aac_time;
+  uint32_t aac_skip;
   /* The rate and channels of the samples below; a decoder may change them
    * from frame to frame, whatever the file said at the start. */
   int sample_rate;
@@ -150,11 +153,16 @@ static int open_decoder(struct yapfast_video *video, const AVCodecParameters *pa
     case AV_CODEC_ID_H264: {
       const AVCodec *codec = avcodec_find_decoder(parameters->codec_id);
 #ifdef __APPLE__
-      /* The demuxer says how many pictures B-frames reorder by. */
+      /* How many pictures B-frames reorder by: MP4's demuxer counts them
+       * from the samples its index lists, though not a fragmented file's,
+       * whose index comes later; other demuxers don't, and the stream says. */
       if (!codec) {
+        const AVStream *stream = video->format->streams[video->stream];
+        int counted = parameters->video_delay > 0 ||
+                      (av_match_name("mp4", video->format->iformat->name) && stream->nb_frames > 0);
         video->decoder = DECODER_VIDEOTOOLBOX;
         video->vt = yapfast_vt_new(parameters->extradata, (size_t)parameters->extradata_size,
-                                   parameters->video_delay);
+                                   counted ? parameters->video_delay : -1);
         return video->vt ? 0 : FAILED;
       }
 #endif
@@ -498,19 +506,24 @@ static int feed(struct yapfast_video *video) {
         /* Damaged sound is left out. */
         int frames = yapfast_aac_decode(video->aac, packet->data, (size_t)packet->size,
                                         &video->aac_samples);
+        if (frames < 0) frames = 0;
         /* The samples the encoder primed with, and padded the end with, as
-         * the demuxer marks them; FFmpeg's decoders leave them out too. */
+         * the demuxer marks them, and the packets an edit list cuts, decoded
+         * for the sound after them: FFmpeg's decoders leave them out too,
+         * the priming counting down across packets, cut ones as well. */
         size_t marked = 0;
         const uint8_t *skip = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &marked);
-        int start = 0;
-        if (frames > 0 && skip && marked >= 8) {
-          uint32_t front = skip[0] | skip[1] << 8 | skip[2] << 16 | (uint32_t)skip[3] << 24;
-          uint32_t back = skip[4] | skip[5] << 8 | skip[6] << 16 | (uint32_t)skip[7] << 24;
-          start = front < (uint32_t)frames ? (int)front : frames;
-          frames -= start;
-          frames -= back < (uint32_t)frames ? (int)back : frames;
-          video->aac_samples += (size_t)start * (size_t)video->channels;
+        uint32_t back = 0;
+        if (skip && marked >= 8) {
+          video->aac_skip = skip[0] | skip[1] << 8 | skip[2] << 16 | (uint32_t)skip[3] << 24;
+          back = skip[4] | skip[5] << 8 | skip[6] << 16 | (uint32_t)skip[7] << 24;
         }
+        uint32_t front = video->aac_skip < (uint32_t)frames ? video->aac_skip : (uint32_t)frames;
+        video->aac_skip -= front;
+        int start = packet->flags & AV_PKT_FLAG_DISCARD ? frames : (int)front;
+        frames -= start;
+        frames -= back < (uint32_t)frames ? (int)back : frames;
+        if (frames > 0) video->aac_samples += (size_t)start * (size_t)video->channels;
         video->aac_frames = frames;
         video->aac_time =
             packet->pts == AV_NOPTS_VALUE
@@ -542,10 +555,19 @@ static int feed(struct yapfast_video *video) {
       vpx_codec_decode(&video->vpx, packet->data, (unsigned)packet->size, NULL, 0);
       break;
 #ifdef __APPLE__
-    case DECODER_VIDEOTOOLBOX:
-      /* A damaged packet is skipped. */
-      yapfast_vt_send(video->vt, packet->data, (size_t)packet->size, packet->pts);
+    case DECODER_VIDEOTOOLBOX: {
+      /* New parameter sets, as when an MP4 file's samples change their
+       * description. */
+      size_t record_size = 0;
+      const uint8_t *record =
+          av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &record_size);
+      if (record) yapfast_vt_configure(video->vt, record, record_size);
+      /* A damaged packet is skipped; one an edit list cuts is decoded for the
+       * pictures that refer to it. */
+      yapfast_vt_send(video->vt, packet->data, (size_t)packet->size, packet->pts,
+                      (packet->flags & AV_PKT_FLAG_DISCARD) != 0);
       break;
+    }
 #endif
     default: {
       /* dav1d takes no empty data. */
@@ -647,6 +669,7 @@ int yapfast_video_seek(struct yapfast_video *video, int64_t time_ms) {
   if (video->aac) {
     yapfast_aac_reset(video->aac);
     video->aac_frames = 0;
+    video->aac_skip = 0;
   }
 #endif
   if (video->dav1d) {
