@@ -8,6 +8,13 @@ yapfast_release_target=${1:?usage: source scripts/release-env TARGET}
 yapfast_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Widest first: rustc and Clang take the last mapping that matches.
 yapfast_maps=("$HOME=/home" "${CARGO_HOME:-$HOME/.cargo}=/cargo" "$yapfast_root=/yapfast")
+if [[ "$yapfast_release_target" == *-apple-darwin ]]; then
+  # macOS's file systems ignore case, so pwd gives the folder as it was
+  # typed, such as ~/dev/yapfast, but Cargo names it as it's stored, such as
+  # ~/Dev/yapfast. Map Cargo's spelling too.
+  yapfast_cargo_root=$(cd "$yapfast_root" && cargo locate-project --workspace --message-format plain)
+  yapfast_maps+=("${yapfast_cargo_root%/Cargo.toml}=/yapfast")
+fi
 yapfast_rust=()
 yapfast_c=()
 for map in "${yapfast_maps[@]}"; do
@@ -35,5 +42,5 @@ fi
 yapfast_cflags="CFLAGS_$yapfast_target_flags" yapfast_cxxflags="CXXFLAGS_$yapfast_target_flags"
 export "$yapfast_cflags=${!yapfast_cflags:-} ${yapfast_c[*]}"
 export "$yapfast_cxxflags=${!yapfast_cxxflags:-} ${yapfast_c[*]}"
-unset yapfast_release_target yapfast_root yapfast_maps yapfast_rust yapfast_c map \
+unset yapfast_release_target yapfast_root yapfast_cargo_root yapfast_maps yapfast_rust yapfast_c map \
   yapfast_target_flags yapfast_cflags yapfast_cxxflags

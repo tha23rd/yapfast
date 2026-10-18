@@ -326,7 +326,10 @@ AWS-LC's errors and asserts, so a plain build names its builder's home folder
 thousands of times, through `~/.cargo`. `scripts/release-env TARGET`, sourced
 before `cargo build --target TARGET`, maps the home folder, Cargo's folder and
 the repository to `/home`, `/cargo` and `/yapfast` with `--remap-path-prefix`
-and Clang's `-ffile-prefix-map`. On Windows it takes `cargo xwin env`'s
+and Clang's `-ffile-prefix-map`. On macOS, whose file systems ignore case,
+it maps the repository as Cargo names it too: as stored, such as
+`~/Dev/yapfast`, where `pwd` gives it as typed, `~/dev/yapfast`, and the
+binary would name `/home/Dev/yapfast`. On Windows it takes `cargo xwin env`'s
 environment and adds the C flags to it, since `cargo xwin build` sets the
 `CFLAGS_<target>` the `cc` crate reads first; `scripts/build-windows` uses it.
 `scripts/package-windows.py` refuses an executable holding the home folder's
