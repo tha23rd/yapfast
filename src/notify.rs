@@ -1,6 +1,7 @@
 //! Desktop notifications. On Linux they go to the freedesktop notification service,
-//! which GNOME, KDE and the other desktops run; clicking one opens its conversation.
-//! Elsewhere Yapfast doesn't show them yet.
+//! which GNOME, KDE and the other desktops run, and on macOS to its Notification
+//! Center; clicking one opens its conversation. Elsewhere Yapfast doesn't show
+//! them yet.
 
 use yapfast_core::chat::Alert;
 
@@ -16,6 +17,8 @@ pub struct Style {
 pub struct Notifier {
     #[cfg(target_os = "linux")]
     requests: std::sync::mpsc::Sender<(Alert, Style)>,
+    #[cfg(target_os = "macos")]
+    center: Option<macos::Center>,
 }
 
 impl Notifier {
@@ -33,7 +36,13 @@ impl Notifier {
             }
             Self { requests }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                center: macos::Center::start(opened),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = opened;
             Self {}
@@ -43,7 +52,11 @@ impl Notifier {
     pub fn show(&self, alert: Alert, style: Style) {
         #[cfg(target_os = "linux")]
         let _ = self.requests.send((alert, style));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        if let Some(center) = &self.center {
+            center.show(&alert, style);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (alert, style);
     }
 }
@@ -55,6 +68,134 @@ fn body(alert: &Alert, style: Style) -> String {
         alert.body.clone()
     } else {
         "New message".into()
+    }
+}
+
+/// Notification Center hands notifications to the app they come from, so
+/// clicking one in it opens the conversation here.
+#[cfg(target_os = "macos")]
+mod macos {
+    use block2::RcBlock;
+    use objc2::{
+        AllocAnyThread, DefinedClass, define_class, msg_send,
+        rc::Retained,
+        runtime::{Bool, NSObjectProtocol, ProtocolObject},
+    };
+    use objc2_foundation::{NSBundle, NSError, NSObject, NSString};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+        UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
+        UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    };
+    use yapfast_core::chat::Alert;
+
+    use super::Style;
+
+    struct Ivars {
+        opened: fn(String),
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements, and Delegate has
+        // no Drop of its own.
+        #[unsafe(super(NSObject))]
+        #[name = "YapfastNotificationDelegate"]
+        #[ivars = Ivars]
+        /// Shows notifications while Yapfast is in front too, and opens the
+        /// conversation of one that's clicked.
+        struct Delegate;
+
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        unsafe impl UNUserNotificationCenterDelegate for Delegate {
+            #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+            fn present(
+                &self,
+                _: &UNUserNotificationCenter,
+                _: &UNNotification,
+                show: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+            ) {
+                show.call((UNNotificationPresentationOptions::Banner
+                    | UNNotificationPresentationOptions::List,));
+            }
+
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            fn clicked(
+                &self,
+                _: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                done: &block2::DynBlock<dyn Fn()>,
+            ) {
+                let room = response
+                    .notification()
+                    .request()
+                    .content()
+                    .threadIdentifier()
+                    .to_string();
+                let opened = self.ivars().opened;
+                let _ = slint::invoke_from_event_loop(move || opened(room));
+                done.call(());
+            }
+        }
+    );
+
+    pub struct Center {
+        center: Retained<UNUserNotificationCenter>,
+        _delegate: Retained<Delegate>,
+    }
+
+    impl Center {
+        /// Asks to show notifications, which macOS asks the person once.
+        /// `None` outside an app bundle, as from `cargo run`: Notification
+        /// Center knows apps by their bundle, and ends a process without one
+        /// that asks.
+        pub fn start(opened: fn(String)) -> Option<Self> {
+            NSBundle::mainBundle().bundleIdentifier()?;
+            let center = UNUserNotificationCenter::currentNotificationCenter();
+            let delegate = Delegate::alloc().set_ivars(Ivars { opened });
+            // SAFETY: NSObject's init, on a Delegate with its ivars set.
+            let delegate: Retained<Delegate> = unsafe { msg_send![super(delegate), init] };
+            center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            center.requestAuthorizationWithOptions_completionHandler(
+                UNAuthorizationOptions::Alert,
+                &RcBlock::new(|allowed: Bool, _: *mut NSError| {
+                    if !allowed.as_bool() {
+                        tracing::info!("notifications are turned off for Yapfast");
+                    }
+                }),
+            );
+            Some(Self {
+                center,
+                _delegate: delegate,
+            })
+        }
+
+        pub fn show(&self, alert: &Alert, style: Style) {
+            let content = UNMutableNotificationContent::new();
+            content.setTitle(&NSString::from_str(&alert.title));
+            content.setBody(&NSString::from_str(&super::body(alert, style)));
+            // Groups a conversation's notifications, and says which to open.
+            // Yapfast plays its own sounds, so it asks for none.
+            content.setThreadIdentifier(&NSString::from_str(&alert.room));
+            // Each its own, so none replaces another.
+            let made = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                &NSString::from_str(&made.to_string()),
+                &content,
+                None,
+            );
+            self.center.addNotificationRequest_withCompletionHandler(
+                &request,
+                Some(&RcBlock::new(|error: *mut NSError| {
+                    if !error.is_null() {
+                        tracing::warn!("could not show a notification");
+                    }
+                })),
+            );
+        }
     }
 }
 

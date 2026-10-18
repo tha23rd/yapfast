@@ -6,8 +6,9 @@
 //! room in the speakers' queue. Samples go to the system as they are, with no
 //! copy of their own.
 //!
-//! Linux goes through PulseAudio, or PipeWire's PulseAudio server, and
-//! Windows through WASAPI. Other systems have no sound here yet.
+//! Linux goes through PulseAudio, or PipeWire's PulseAudio server, Windows
+//! through WASAPI, and macOS through Audio Queue Services. Other systems have
+//! no sound here yet.
 
 use std::{marker::PhantomData, time::Duration};
 #[cfg(feature = "discord")]
@@ -28,13 +29,22 @@ mod wasapi;
 #[cfg(target_os = "windows")]
 use wasapi as platform;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+mod coreaudio;
+#[cfg(target_os = "macos")]
+use coreaudio as platform;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 use unsupported as platform;
 
 /// Whether this system has sound here.
-pub const AVAILABLE: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+pub const AVAILABLE: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos"
+));
 
 /// The rate every stream runs at, unless it asks for another.
 pub const RATE: u32 = 48_000;
@@ -194,6 +204,8 @@ impl<S: Sample> Input<S> {
 
 /// What [`others`] hears from the other applications playing.
 #[cfg(feature = "discord")]
+// macOS hears no other applications yet.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum Heard<'a> {
     /// An application started playing, from this process when the system says.
     Started {
@@ -331,6 +343,53 @@ mod tests {
             "name:Unplugged speakers"
         };
         assert!(Output::<i16>::open(Some(gone), "Test", RATE, 2, None).is_err());
+    }
+
+    /// Writing waits as the speakers play, and reading as the microphone
+    /// records, so a second of either takes about a second.
+    #[test]
+    #[ignore = "needs sound devices"]
+    fn streams_keep_time() {
+        let mut output = Output::<i16>::open(
+            None,
+            "Test silence",
+            RATE,
+            2,
+            Some(Duration::from_millis(60)),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let frame = [0i16; RATE as usize / 50 * 2];
+        for _ in 0..50 {
+            output.write(&frame).unwrap();
+        }
+        let written = started.elapsed();
+        output.drain().unwrap();
+        let drained = started.elapsed();
+        eprintln!("wrote a second in {written:?}, drained by {drained:?}");
+        assert!(
+            (850..1100).contains(&written.as_millis()),
+            "wrote a second in {written:?}"
+        );
+        assert!(
+            (950..1250).contains(&drained.as_millis()),
+            "drained by {drained:?}"
+        );
+        let mut input =
+            Input::<i16>::open(None, "Test input", 16_000, 1, Duration::from_millis(20)).unwrap();
+        // The microphone takes a moment to start.
+        input.read(&mut [0; 320]).unwrap();
+        let started = std::time::Instant::now();
+        let mut heard = [0i16; 320];
+        for _ in 0..50 {
+            input.read(&mut heard).unwrap();
+        }
+        let read = started.elapsed();
+        eprintln!("read a second in {read:?}");
+        assert!(
+            (850..1150).contains(&read.as_millis()),
+            "read a second in {read:?}"
+        );
     }
 
     fn tone(at: usize) -> f32 {

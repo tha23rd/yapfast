@@ -175,9 +175,23 @@ fn the_composers_menu_cuts_copies_and_pastes_through_the_application() {
     assert_eq!(window.get_draft(), "hello");
     choose(0.);
     choose(2.);
-    window.window().dispatch_event(WindowEvent::KeyPressed {
-        text: Key::End.into(),
-    });
+    // To the end: End, or on the Mac, where End scrolls, Command-Right, which
+    // is Slint's Control there.
+    let to_end: &[Key] = if cfg!(target_os = "macos") {
+        &[Key::Control, Key::RightArrow]
+    } else {
+        &[Key::End]
+    };
+    for key in to_end {
+        window.window().dispatch_event(WindowEvent::KeyPressed {
+            text: (*key).into(),
+        });
+    }
+    for key in to_end.iter().rev() {
+        window.window().dispatch_event(WindowEvent::KeyReleased {
+            text: (*key).into(),
+        });
+    }
     choose(1.);
     assert_eq!(window.get_draft(), "hellohello", "Select All, then Copy");
     // Without a selection there is nothing to cut: the rows are Paste and

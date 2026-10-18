@@ -268,6 +268,8 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
         zoom::apply(window.window(), base.get(), level.get());
         let note = Rc::new(slint::Timer::default());
         let mut keys = zoom::Keys::default();
+        #[cfg(target_os = "macos")]
+        let mut command = false;
         // The winit window exists by the first event it sends.
         #[cfg(target_os = "linux")]
         let mut watching = false;
@@ -375,6 +377,37 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                             zoom::apply(window.window(), base.get(), level.get());
                         }
                     });
+                }
+                // The window shortcuts Mac apps share, which winit's menu
+                // leaves out: Command-W closes the window, Command-M
+                // minimizes it.
+                #[cfg(target_os = "macos")]
+                {
+                    use slint::winit_030::winit::{event::ElementState, keyboard::Key};
+                    match event {
+                        WindowEvent::ModifiersChanged(modifiers) => {
+                            command = modifiers.state().super_key();
+                        }
+                        WindowEvent::KeyboardInput { event, .. }
+                            if command && event.state == ElementState::Pressed =>
+                        {
+                            match event.logical_key.as_ref() {
+                                Key::Character("w") => {
+                                    slint_window.dispatch_event(
+                                        slint::platform::WindowEvent::CloseRequested,
+                                    );
+                                    return EventResult::PreventDefault;
+                                }
+                                Key::Character("m") => {
+                                    slint_window.set_minimized(true);
+                                    return EventResult::PreventDefault;
+                                }
+                                _ => {}
+                            }
+                        }
+                        WindowEvent::Focused(false) => command = false,
+                        _ => {}
+                    }
                 }
                 let step = match keys.event(event) {
                     zoom::Outcome::Pass => return EventResult::Propagate,

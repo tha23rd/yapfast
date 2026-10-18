@@ -326,7 +326,8 @@ pub struct Controller {
 }
 
 impl Controller {
-    #[cfg(all(test, feature = "matrix"))]
+    // For `matrix_voice`'s tests, which run on Linux.
+    #[cfg(all(test, feature = "matrix", target_os = "linux"))]
     pub(crate) fn start(session: SessionLease) -> Result<Self> {
         let calls = Calls {
             session,

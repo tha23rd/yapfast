@@ -1,7 +1,9 @@
 //! A colour bitmap font made at runtime, so Discord's custom emoji show inline
 //! in message text: Slint's `StyledText` draws only glyphs. Each emoji is a PNG
 //! in a CBDT table, the format of the Noto Color Emoji build Yapfast already draws,
-//! at a Private Use Area code point. The font's vertical metrics are the UI
+//! at a Private Use Area code point. On macOS, where Skia reads fonts through
+//! Core Text, which doesn't take CBDT, the PNGs go in an sbix table, Apple's
+//! format and Apple Color Emoji's. The font's vertical metrics are the UI
 //! typeface's, Atkinson Hyperlegible Next's, so a line with an emoji keeps its
 //! baseline.
 
@@ -28,9 +30,17 @@ const ADVANCE: u8 = 140;
 pub fn build(family: &str, glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
     let count = u16::try_from(glyphs.len() + 1).expect("fewer than 65535 glyphs");
     let advance = units(i32::from(ADVANCE));
-    let tables: [([u8; 4], Vec<u8>); 10] = [
-        (*b"CBDT", cbdt(glyphs)),
-        (*b"CBLC", cblc(glyphs)),
+    let bitmaps = if cfg!(target_os = "macos") {
+        vec![
+            (*b"sbix", sbix(glyphs)),
+            (*b"glyf", glyf(glyphs)),
+            (*b"loca", loca(glyphs)),
+        ]
+    } else {
+        vec![(*b"CBDT", cbdt(glyphs)), (*b"CBLC", cblc(glyphs))]
+    };
+    let mut tables: Vec<([u8; 4], Vec<u8>)> = bitmaps;
+    tables.extend([
         (*b"OS/2", os2(advance, glyphs)),
         (*b"cmap", cmap(glyphs)),
         (*b"head", head(advance)),
@@ -39,7 +49,9 @@ pub fn build(family: &str, glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
         (*b"maxp", maxp(count)),
         (*b"name", name(family)),
         (*b"post", post()),
-    ];
+    ]);
+    // In the order of their tags, as fonts list their tables.
+    tables.sort_by_key(|(tag, _)| *tag);
     let mut font = Vec::new();
     let entry_selector = (tables.len() as u16).ilog2() as u16;
     let search_range = 16u16 << entry_selector;
@@ -108,6 +120,80 @@ fn cbdt(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
         put8(&mut out, ADVANCE);
         put32(&mut out, png.len() as u32);
         out.extend_from_slice(png);
+    }
+    out
+}
+
+/// The bitmaps as Apple has them: one strike at [`PPEM`], each glyph's PNG at
+/// the bottom left corner of its box in `glyf`. Glyph 0, `.notdef`, has none.
+fn sbix(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put16(&mut out, 1);
+    // Bit 0 is always set.
+    put16(&mut out, 1);
+    put32(&mut out, 1);
+    // The strike, after the header.
+    put32(&mut out, 12);
+    put16(&mut out, u16::from(PPEM));
+    put16(&mut out, 72);
+    // Each glyph's offset from the strike's start, and where the last ends.
+    let mut offset = 4 + 4 * (glyphs.len() as u32 + 2);
+    put32(&mut out, offset);
+    put32(&mut out, offset);
+    for (_, png) in glyphs {
+        offset += 8 + png.len() as u32;
+        put32(&mut out, offset);
+    }
+    for (_, png) in glyphs {
+        put16(&mut out, 0);
+        put16(&mut out, 0);
+        out.extend_from_slice(b"png ");
+        out.extend_from_slice(png);
+    }
+    out
+}
+
+/// The bytes of each emoji's outline in `glyf`.
+const OUTLINE: usize = 26;
+
+/// Core Text takes a font only with outlines, and draws an sbix bitmap over
+/// its glyph's box, which an empty outline doesn't have. As in Apple Color
+/// Emoji, each emoji's outline is two contours of a point each, at the
+/// corners of where its bitmap goes.
+fn glyf(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
+    let left = units(i32::from(BEARING_X));
+    let bottom = units(i32::from(BEARING_Y) - SIDE as i32);
+    let right = units(i32::from(BEARING_X) + SIDE as i32);
+    let top = units(i32::from(BEARING_Y));
+    let mut out = Vec::new();
+    for _ in glyphs {
+        put16(&mut out, 2);
+        for edge in [left, bottom, right, top] {
+            put16(&mut out, edge as u16);
+        }
+        // The contours' last points, and no instructions.
+        put16(&mut out, 0);
+        put16(&mut out, 1);
+        put16(&mut out, 0);
+        // Both points on the curve, their coordinates 16-bit steps from the last.
+        put8(&mut out, 1);
+        put8(&mut out, 1);
+        put16(&mut out, left as u16);
+        put16(&mut out, (right - left) as u16);
+        put16(&mut out, bottom as u16);
+        put16(&mut out, (top - bottom) as u16);
+    }
+    debug_assert_eq!(out.len(), OUTLINE * glyphs.len());
+    out
+}
+
+/// Where each glyph's outline is in `glyf`, in halves of its offset, as
+/// `head` says: `.notdef`'s empty, then each emoji's.
+fn loca(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put16(&mut out, 0);
+    for index in 0..=glyphs.len() {
+        put16(&mut out, (index * OUTLINE / 2) as u16);
     }
     out
 }
@@ -291,11 +377,25 @@ fn hmtx(advance: i16, count: u16) -> Vec<u8> {
     out
 }
 
-/// Version 0.5: the glyph count alone, for a font without outlines.
+/// Version 0.5: the glyph count alone, for a font without outlines, or on
+/// macOS 1.0, for the outlines `glyf` gives each emoji.
 fn maxp(count: u16) -> Vec<u8> {
     let mut out = Vec::new();
-    put32(&mut out, 0x0000_5000);
-    put16(&mut out, count);
+    if cfg!(target_os = "macos") {
+        put32(&mut out, 0x0001_0000);
+        put16(&mut out, count);
+        // Each outline's two points in two contours; no composites.
+        put16(&mut out, 2);
+        put16(&mut out, 2);
+        put16(&mut out, 0);
+        put16(&mut out, 0);
+        // Two zones, and no hinting.
+        put16(&mut out, 2);
+        out.extend_from_slice(&[0; 16]);
+    } else {
+        put32(&mut out, 0x0000_5000);
+        put16(&mut out, count);
+    }
     out
 }
 

@@ -1,5 +1,6 @@
 //! Zooming the whole window, as browsers do: Ctrl with + or -, or with the
-//! scroll wheel, steps through [`LEVELS`], and Ctrl+0 returns to 100%.
+//! scroll wheel, steps through [`LEVELS`], and Ctrl+0 returns to 100%. On
+//! macOS it's Command, as for Slint's own shortcuts there.
 //!
 //! Slint draws everything in logical pixels, so the zoom multiplies the
 //! display's own scale factor: text, spacing and pictures all grow together,
@@ -7,8 +8,14 @@
 
 use slint::winit_030::winit::{
     event::{ElementState, MouseScrollDelta, WindowEvent},
-    keyboard::{Key, KeyCode, PhysicalKey},
+    keyboard::{Key, KeyCode, ModifiersState, PhysicalKey},
 };
+
+/// The key held to zoom.
+#[cfg(target_os = "macos")]
+const HELD: ModifiersState = ModifiersState::SUPER;
+#[cfg(not(target_os = "macos"))]
+const HELD: ModifiersState = ModifiersState::CONTROL;
 
 /// The zoom levels, smallest first: 5% apart up to 150%, where small changes
 /// matter most, then 10% apart.
@@ -60,7 +67,7 @@ impl Keys {
     pub fn event(&mut self, event: &WindowEvent) -> Outcome {
         match event {
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.control = modifiers.state().control_key();
+                self.control = modifiers.state().contains(HELD);
                 self.alt = modifiers.state().alt_key();
                 if !self.control {
                     self.scrolled = 0.;
@@ -245,7 +252,6 @@ mod tests {
         use slint::winit_030::winit::{
             dpi::PhysicalPosition,
             event::{DeviceId, TouchPhase},
-            keyboard::ModifiersState,
         };
         let mut keys = Keys::default();
         let wheel = |delta| WindowEvent::MouseWheel {
@@ -258,9 +264,7 @@ mod tests {
             matches!(keys.event(&pixels(30.)), Outcome::Pass),
             "without Ctrl it scrolls"
         );
-        keys.event(&WindowEvent::ModifiersChanged(
-            ModifiersState::CONTROL.into(),
-        ));
+        keys.event(&WindowEvent::ModifiersChanged(HELD.into()));
         assert!(matches!(keys.event(&pixels(30.)), Outcome::Taken));
         assert!(matches!(keys.event(&pixels(40.)), Outcome::Step(Step::In)));
         assert!(matches!(keys.event(&pixels(-20.)), Outcome::Taken));

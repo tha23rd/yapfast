@@ -106,6 +106,15 @@ windows = { version = "0.62", features = [
 # What `#[implement]` expands to names it.
 windows-core = "0.62"
 
+# Yapfast's own sound goes through Audio Queue Services, which convert between
+# a stream's format and the device's, and Core Audio names the devices. The
+# same objc2 bindings winit already builds for macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioQueue", "objc2-core-audio", "objc2-core-audio-types", "objc2-core-foundation"] }
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFBase", "CFString", "CFRunLoop"] }
+
 [dev-dependencies]
 # Animated PNGs to read frame timings from, the version the image crate uses.
 png = "0.18"

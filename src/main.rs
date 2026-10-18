@@ -62,12 +62,12 @@ fn main() -> Result<()> {
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
     let renderer = renderer_argument(&mut arguments)?;
     let background = flag_argument(&mut arguments, "--background");
-    #[cfg(all(windows, feature = "desktop"))]
+    #[cfg(all(any(windows, target_os = "macos"), feature = "desktop"))]
     match data_directory(&arguments) {
         Some(directory) if !has_console() => logging::init_to_file(&directory.join("yapfast.log")),
         _ => logging::init(),
     }
-    #[cfg(not(all(windows, feature = "desktop")))]
+    #[cfg(not(all(any(windows, target_os = "macos"), feature = "desktop")))]
     logging::init();
     yapfast_core::init_tls()?;
 
@@ -163,8 +163,26 @@ fn has_console() -> bool {
     }
 }
 
+/// Whether Yapfast's output reaches someone. Opened from the Finder or the
+/// Dock, a Mac app's goes to /dev/null.
+#[cfg(all(target_os = "macos", feature = "desktop"))]
+fn has_console() -> bool {
+    use std::os::{fd::AsFd, unix::fs::MetadataExt};
+    let discarded = |output: std::fs::Metadata| {
+        std::fs::metadata("/dev/null")
+            .is_ok_and(|null| (null.dev(), null.ino()) == (output.dev(), output.ino()))
+    };
+    // The log goes to standard output.
+    let output = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(std::fs::File::from)
+        .and_then(|output| output.metadata());
+    output.is_ok_and(|output| !discarded(output))
+}
+
 /// The folder Yapfast keeps its files in, which holds the log without a console.
-#[cfg(all(windows, feature = "desktop"))]
+#[cfg(all(any(windows, target_os = "macos"), feature = "desktop"))]
 fn data_directory(arguments: &[String]) -> Option<std::path::PathBuf> {
     match arguments
         .iter()

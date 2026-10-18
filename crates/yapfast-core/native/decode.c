@@ -1,6 +1,8 @@
 /* Decoding Go Live video someone else streams: VP8 through libvpx and H264
- * through FFmpeg, both inside Yapfast's libwebrtc archive. Pictures come out
- * as I420 planes that stay valid until the next call on the decoder. */
+ * through FFmpeg, both inside Yapfast's libwebrtc archive, or on macOS, whose
+ * archive has no FFmpeg decoder for H264, through VideoToolbox
+ * (videotoolbox.c). Pictures come out as I420 planes that stay valid until
+ * the next call on the decoder. */
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +10,9 @@
 #include "libavcodec/avcodec.h"
 #include "vpx/vp8dx.h"
 #include "vpx/vpx_decoder.h"
+#ifdef __APPLE__
+#include "videotoolbox.h"
+#endif
 
 enum { YAPFAST_VP8 = 0, YAPFAST_H264 = 1 };
 
@@ -23,6 +28,7 @@ struct yapfast_decoder {
   AVFrame *frame;
   unsigned char *padded;
   size_t padded_size;
+  struct yapfast_vt *vt;
 };
 
 struct yapfast_picture {
@@ -46,6 +52,9 @@ void yapfast_decoder_free(struct yapfast_decoder *decoder) {
     av_frame_free(&decoder->frame);
     free(decoder->padded);
   }
+#ifdef __APPLE__
+  yapfast_vt_free(decoder->vt);
+#endif
   free(decoder);
 }
 
@@ -66,6 +75,18 @@ struct yapfast_decoder *yapfast_decoder_new(int codec, unsigned threads) {
     return NULL;
   }
   const AVCodec *h264 = avcodec_find_decoder(AV_CODEC_ID_H264);
+#ifdef __APPLE__
+  /* Each picture comes out as soon as it's decoded: Go Live streams have no
+   * B-frames to reorder. */
+  if (!h264) {
+    decoder->vt = yapfast_vt_new(NULL, 0, 0);
+    if (!decoder->vt) {
+      free(decoder);
+      return NULL;
+    }
+    return decoder;
+  }
+#endif
   decoder->context = h264 ? avcodec_alloc_context3(h264) : NULL;
   decoder->packet = av_packet_alloc();
   decoder->frame = av_frame_alloc();
@@ -106,6 +127,23 @@ int yapfast_decoder_decode(struct yapfast_decoder *decoder, const unsigned char 
     picture->v_stride = image->stride[VPX_PLANE_V];
     return 1;
   }
+#ifdef __APPLE__
+  if (decoder->vt) {
+    if (yapfast_vt_send(decoder->vt, data, size, YAPFAST_VT_NO_TIME) < 0) return -1;
+    struct yapfast_vt_picture decoded;
+    int got = yapfast_vt_receive(decoder->vt, &decoded);
+    if (got <= 0) return got;
+    picture->width = decoded.width;
+    picture->height = decoded.height;
+    picture->y = decoded.data[0];
+    picture->u = decoded.data[1];
+    picture->v = decoded.data[2];
+    picture->y_stride = decoded.stride[0];
+    picture->u_stride = decoded.stride[1];
+    picture->v_stride = decoded.stride[2];
+    return 1;
+  }
+#endif
   /* FFmpeg's parsers may read a little past the end. */
   size_t needed = size + AV_INPUT_BUFFER_PADDING_SIZE;
   if (decoder->padded_size < needed) {

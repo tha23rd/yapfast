@@ -12,6 +12,10 @@ fn main() {
         "video.c",
         "picture.c",
         "camera.cc",
+        "videotoolbox.c",
+        "videotoolbox.h",
+        "audiotoolbox.c",
+        "audiotoolbox.h",
     ] {
         println!("cargo:rerun-if-changed=native/{file}");
     }
@@ -23,6 +27,10 @@ fn main() {
         .warnings(true)
         .compile("yapfast_picture");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // This crate's tests start LiveKit too; see the root build.rs.
+    if target_os == "macos" {
+        println!("cargo:rustc-link-arg=-ObjC");
+    }
     // Linux captures through V4L2, and Windows through DirectShow, both in
     // the same module of the libwebrtc archive.
     if matches!(target_os.as_str(), "linux" | "windows") {
@@ -63,7 +71,24 @@ fn main() {
         Ok("aarch64") => "arm64",
         _ => "x64",
     };
-    cc::Build::new()
+    let mut codecs = cc::Build::new();
+    // The Mac's archive has no FFmpeg decoder for H264 or AAC; VideoToolbox
+    // and AudioToolbox decode them.
+    if target_os == "macos" {
+        codecs
+            .file("native/videotoolbox.c")
+            .file("native/audiotoolbox.c");
+        for framework in [
+            "AudioToolbox",
+            "CoreFoundation",
+            "CoreMedia",
+            "CoreVideo",
+            "VideoToolbox",
+        ] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
+    codecs
         .file("native/vp8.c")
         .file("native/h264.c")
         .file("native/clip.c")
