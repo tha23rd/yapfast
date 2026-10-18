@@ -45,7 +45,11 @@ fi
 export SKIA_BINARIES_URL="file://$native/$skia"
 export LK_CUSTOM_WEBRTC="$native/$webrtc"
 export YAPFAST_WEBRTC_ARCHIVE="$native/$webrtc.zip"
-export PROTOC=${PROTOC:-$(command -v protoc)}
+PROTOC=${PROTOC:-$(command -v protoc)} || {
+  echo "scripts/build-macos needs protoc: brew install protobuf, or set PROTOC" >&2
+  exit 1
+}
+export PROTOC
 
 # Source paths that name no folder here.
 source scripts/release-env $target

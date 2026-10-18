@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.parse
 
 from release_package import ROOT, dependency_notices, digest, names_home, source_snapshot
@@ -48,6 +49,8 @@ def skia_source():
     stamp = cache / "skia-source.json"
     if source.is_dir() and stamp.is_file() and json.loads(stamp.read_text()).get("pins") == pins:
         return source
+    # The stamp goes first, so a fetch that fails partway isn't taken later.
+    stamp.unlink(missing_ok=True)
     shutil.rmtree(source, ignore_errors=True)
     archive = cache / "skia-source.tar.gz"
     if not archive.is_file() or digest(archive) != sha256:
@@ -176,8 +179,14 @@ def main():
         # Dragging the app onto Applications installs it.
         (image / "Applications").symlink_to("/Applications")
         image_path.unlink(missing_ok=True)
-        subprocess.run(["hdiutil", "create", "-quiet", "-volname", "Yapfast", "-srcfolder", str(image),
-                        "-fs", "HFS+", "-format", "ULFO", str(image_path)], check=True, timeout=1800)
+        create = ["hdiutil", "create", "-quiet", "-volname", "Yapfast", "-srcfolder", str(image),
+                  "-fs", "HFS+", "-format", "ULFO", str(image_path)]
+        # hdiutil sometimes fails with "Resource busy" on GitHub's runners; it
+        # gets one more try.
+        if subprocess.run(create, timeout=1800).returncode:
+            image_path.unlink(missing_ok=True)
+            time.sleep(10)
+            subprocess.run(create, check=True, timeout=1800)
     hashes = output / "SHA256SUMS.txt"
     artifacts = [image_path, source_path]
     hashes.write_text("".join(f"{digest(path)}  {path.name}\n" for path in artifacts), encoding="utf-8")
