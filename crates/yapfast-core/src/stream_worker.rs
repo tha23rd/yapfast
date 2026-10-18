@@ -431,7 +431,51 @@ struct Video {
     sender: StreamSender,
     encoder: Encoder,
     /// Other applications' sound, while sharing a screen.
-    _sound: Option<stream_audio::Capture>,
+    sound: SharedSound,
+}
+
+/// Other applications' sound for a shared screen. It starts on a thread of
+/// its own, as macOS may first ask the person whether Yapfast may record it,
+/// and the video goes on meanwhile; one that starts after the share ended is
+/// dropped there.
+enum SharedSound {
+    Starting(channel::Receiver<Result<stream_audio::Capture>>),
+    On { _capture: stream_audio::Capture },
+    Off,
+}
+
+impl SharedSound {
+    fn start(sound: stream_connection::SoundSender) -> Self {
+        let (started, starting) = channel::channel();
+        let spawned = std::thread::Builder::new()
+            .name("yapfast-stream-sound-start".into())
+            .spawn(move || {
+                let _ = started.send(stream_audio::Capture::start(sound));
+            });
+        match spawned {
+            Ok(_) => Self::Starting(starting),
+            Err(error) => {
+                tracing::warn!(%error, "sharing without sound");
+                Self::Off
+            }
+        }
+    }
+
+    /// Takes the capture once it has started.
+    fn poll(&mut self) {
+        let Self::Starting(starting) = self else {
+            return;
+        };
+        *self = match starting.try_recv() {
+            Ok(Ok(capture)) => Self::On { _capture: capture },
+            Ok(Err(error)) => {
+                tracing::warn!(error = format!("{error:#}"), "sharing without sound");
+                Self::Off
+            }
+            Err(channel::TryRecvError::Empty) => return,
+            Err(channel::TryRecvError::Disconnected) => Self::Off,
+        };
+    }
 }
 
 /// The kbit/s to aim for, as Discord's client does: its cap for frames of
@@ -470,13 +514,9 @@ impl Sink {
         if let Ok(Control::Send(server)) = self.controls.try_recv() {
             let sender = StreamSender::start(server, width, height, self.fps)?;
             let sound = if self.sound {
-                stream_audio::Capture::start(sender.sound())
-                    .inspect_err(|error| {
-                        tracing::warn!(error = format!("{error:#}"), "sharing without sound")
-                    })
-                    .ok()
+                SharedSound::start(sender.sound())
             } else {
-                None
+                SharedSound::Off
             };
             let encoder = Encoder::new(
                 stream_connection::SEND_CODEC,
@@ -488,12 +528,13 @@ impl Sink {
             self.video = Some(Video {
                 sender,
                 encoder,
-                _sound: sound,
+                sound,
             });
         }
         let Some(video) = self.video.as_mut() else {
             return Ok(());
         };
+        video.sound.poll();
         if video.encoder.size() != (width, height) {
             video.encoder = Encoder::new(
                 stream_connection::SEND_CODEC,
