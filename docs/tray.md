@@ -25,11 +25,17 @@ with them open, so turning Yapfast off in Task Manager's Startup apps (an odd
 first byte in `Explorer\StartupApproved\Run`), in System Settings' Login Items
 on macOS 13 and later, or a desktop setting `Hidden=true` or deleting the
 file, shows as off. Only the switch changes it, through a callback of its own;
-a change to any other setting leaves it be. Reading and writing it run on a
-thread of their own, one at a time, as on the Mac each read asks Background
-Task Management. Turning it on here clears Task Manager's record too; on the
-Mac only the person can turn it on again there, so Yapfast opens Login Items
-for them.
+a change to any other setting leaves it be. Turning it on here clears Task
+Manager's record too; on the Mac only the person can turn it on again there,
+so Yapfast opens Login Items for them, and says so under the switch, as it
+says why it couldn't write the entry.
+
+One thread reads and writes the entry, as on the Mac each read asks
+Background Task Management and turning it on waits for its answer
+(`src/ui/sign_in.rs`). It takes requests from a channel, in order; the ones
+waiting come down to the latest, so clicks faster than macOS answers end where
+the switch was left. Each request carries how many times the switch had
+turned, and an answer a later turn overtook changes nothing.
 
 Each start, outside the preview, points an entry that's on at this Yapfast
 when the command it holds is another: after an update to a new folder, as the
@@ -250,12 +256,14 @@ this build, outside Applications:
 - Started against a test server on 127.0.0.1, with an entry naming another
   copy that's still there, without `--data-dir`, Yapfast rewrote it with its
   own program and `--data-dir`, and `statusForLegacyURL:` said enabled. The
-  same app run from a mounted disk image left it be.
+  same app run from a mounted disk image left it be, and its switch said
+  "Yapfast runs from a disk image. Move it to Applications first."
 - Through a probe build's control commands, doing what the switch, another
   setting and opening Settings do: turning it on wrote the entry, waited
   0.7 s for "enabled", and disabled relaunching at sign-in; an entry deleted,
   or written, outside Yapfast stayed so as another setting changed; opening
   Settings read it again; turning it off removed it and enabled relaunching.
+  On, off and on at once ended on, with one answer shown.
 - `launchctl bootstrap` of that entry, with `--preview` and a data folder of
   its own, as signing in loads it: launchd started Yapfast, which had only its
   menu bar icon on screen, no window, was responsible for itself, and logged

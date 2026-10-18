@@ -777,6 +777,9 @@ export component YapfastWindow inherits Window {
     /// again, as the person may change it in Task Manager or System Settings.
     in-out property <bool> start-on-sign-in;
     in property <bool> autostart-available;
+    /// Why the switch couldn't turn it on or off, as "move Yapfast to
+    /// Applications first", shown under it; empty once it could.
+    in property <string> start-on-sign-in-problem;
     callback start-on-sign-in-changed(bool);
     callback check-start-on-sign-in();
     callback restart();
@@ -2821,6 +2824,7 @@ export component YapfastWindow inherits Window {
             gpu-rendering <=> root.gpu-rendering; gpu-running: root.gpu-running;
             close-to-tray <=> root.close-to-tray; tray-available: root.tray-available;
             start-on-sign-in <=> root.start-on-sign-in; autostart-available: root.autostart-available;
+            start-on-sign-in-problem: root.start-on-sign-in-problem;
             preferences-changed => { root.preferences-changed(); }
             start-on-sign-in-changed(on) => { root.start-on-sign-in-changed(on); }
             restart => { root.restart(); }
