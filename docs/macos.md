@@ -295,18 +295,28 @@ process was named 64 ms after it started, and its tone was heard whole.
 A private aggregate device has the tap as its only input, with drift
 compensation, and runs at 48 kHz in 20 ms buffers, so Core Audio resamples
 the mix to Go Live's rate. The worker waits up to a second for the device to
-take the rate, then checks that its input is 32-bit float stereo,
-interleaved, at 48 kHz. The device's IOProc, on Core Audio's real-time
-thread, copies each buffer into a ring of 100 ms and wakes the worker's
-thread, which hands it to the mixer; neither takes a lock, and the IOProc
-catches any panic rather than unwind into Core Audio. Buffers of silence
-through and through are left out, so nothing is sent while nothing plays, as
-on Windows; the resampler rings for about 50 samples at a sound's abrupt
-start and end, below -60 dB. The IOProc runs 50 times a second while nothing
-plays too, so when it goes two seconds without a call, as after the Mac
-sleeps or Core Audio restarts, or the device's format changes, the worker
-makes the tap again; it looks once a second. The ring and its copy take
-77 KB.
+take the rate, or less when the share stops, then checks that its input is
+32-bit float stereo, interleaved, at 48 kHz. The device's IOProc, on Core
+Audio's real-time thread, copies each buffer into a ring of 200 ms and wakes
+a thread that hands it to the mixer; neither takes a lock, and the IOProc
+catches any panic rather than unwind into Core Audio. A buffer that doesn't
+fit whole is dropped, and counted, and the first drop logged. Buffers of
+silence through and through are left out, so nothing is sent while nothing
+plays, as on Windows; the resampler rings for about 50 samples at a sound's
+abrupt start and end, below -60 dB. The ring takes 77 KB.
+
+A second thread follows the tap, so its slower work never holds up the
+sound: looking at a list of processes reads each one's id, parent, program
+and bundle id, which takes longer the more start at once, as when a browser
+starts its helpers.
+A list the tap refuses isn't kept, so it's tried again a second later, then
+after twice as long each time, up to 16 seconds, warning once. The IOProc
+runs 50 times a second while nothing plays too, so when it goes two seconds
+without a call, as after the Mac sleeps or Core Audio restarts, or the
+device gives another format, or twice running won't say which, the thread
+makes the tap again, with a ring of its own; it looks once a second. When
+the stream moves to another server, the old sound stops on a thread of its
+own, as stopping waits for these threads.
 
 macOS asks once whether Yapfast may record other applications' sound, and
 holds the first change to the tap until the person answers, so the share's
@@ -320,6 +330,13 @@ minutes, the change times out (`MACH_RCV_TIMED_OUT`), which counts as refused
 too; any other failure is tried once more with a fresh list of processes. The
 permission belongs to Yapfast.app, the worker being one of its processes; an
 unbundled build run over SSH is refused without asking.
+
+`others::tests` checks the decision on made-up processes: a stream worker
+hears neither itself, the Yapfast that started it, its other workers, another
+Yapfast nor Discord's helpers, and hears the rest, while a test started from
+a shell hears what it starts. It checks that the kernel names the test's own
+parent and program as std does, and that the ring keeps whole buffers across
+its end and drops one that doesn't fit.
 
 Checked on the MacBook Air (macOS 15.3) with
 `audio_io::tests::hears_other_applications`, run from a copy of Yapfast.app
