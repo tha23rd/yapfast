@@ -32,47 +32,70 @@ pub fn set(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Points an entry that's on at this Yapfast, as after an update to a new
-/// folder, as the Windows ZIP, an AppImage and Nix each give a version, or a
-/// move, or when it lacks this one's `--data-dir`. A copy run from a disk
-/// image or a temporary folder, or on the Mac a build outside an app, leaves
-/// it be, so as not to leave it naming nothing once that's gone. It only
-/// writes the entry, and never asks the person anything.
+/// Points an entry that's on at this Yapfast. On Linux and Windows this is
+/// upstream's design, unchanged: each start rewrites the entry with this
+/// Yapfast's command, so moving its folder or an update keeps it working,
+/// and the copy that started last, with its `--data-dir` or without, is the
+/// one that starts. On the Mac only an app that moved, or an update put
+/// somewhere new, takes it over; see `macos_refresh`. It only writes the
+/// entry, and never asks the person anything.
 pub fn refresh() {
     if !enabled() {
         return;
     }
-    let command = match command() {
-        Ok(command) => command,
-        Err(error) => {
-            tracing::info!(%error, "starting at sign-in starts the Yapfast it named");
-            return;
+    #[cfg(target_os = "macos")]
+    let result = macos_refresh();
+    #[cfg(not(target_os = "macos"))]
+    let result = set(true);
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not update starting at sign-in");
+    }
+}
+
+/// Each start on the Mac: this copy takes over an entry naming another
+/// program, when it's an app on a place that stays, not a disk image or a
+/// build run from its folder, and uses the data folder the entry names. Only
+/// the program changes, so the entry's other arguments keep, and only the
+/// switch adds or drops `--data-dir`. An entry that's right stays untouched,
+/// so macOS doesn't say Background Items Added again.
+#[cfg(target_os = "macos")]
+fn macos_refresh() -> std::io::Result<()> {
+    let program = std::env::current_exe()?;
+    if !in_app(&program) || temporary_place(&program).is_some() {
+        return Ok(());
+    }
+    let program = path_text(program)?;
+    let data = data_folder()?;
+    match macos::recorded() {
+        Some(mut recorded) if takes_over(&recorded, &program, data.as_deref()) => {
+            recorded[0] = program;
+            macos::write(&recorded)?;
+            tracing::info!("starting at sign-in now starts this Yapfast");
+            Ok(())
         }
-    };
-    if !takes_over(platform::recorded().as_deref(), &command) {
-        return;
-    }
-    match platform::write(&command) {
-        Ok(()) => tracing::info!("starting at sign-in now starts this Yapfast"),
-        Err(error) => tracing::warn!(%error, "could not update starting at sign-in"),
+        _ => Ok(()),
     }
 }
 
-/// Whether this Yapfast's `command` replaces the one the entry `recorded`:
-/// it's another, and this copy is an installed one.
-fn takes_over(recorded: Option<&[String]>, command: &[String]) -> bool {
-    recorded != Some(command) && installed(std::path::Path::new(&command[0]))
+/// Whether this copy, `program` with the data folder `data`, takes over the
+/// entry that `recorded`: it names another program, with the same data
+/// folder, none for the default.
+#[cfg(any(target_os = "macos", test))]
+fn takes_over(recorded: &[String], program: &str, data: Option<&str>) -> bool {
+    recorded.first().is_some_and(|first| first != program) && data_folder_in(recorded) == data
 }
 
-/// Whether `program` is an installed Yapfast, to start at sign-in in place of
-/// another: everywhere but the Mac, any that isn't somewhere temporary, which
-/// `command` refuses; on the Mac, the program inside an app, not a build run
-/// from its folder.
-fn installed(program: &std::path::Path) -> bool {
-    !cfg!(target_os = "macos") || in_app(program)
+/// The data folder `arguments` give with `--data-dir`, if any.
+fn data_folder_in(arguments: &[String]) -> Option<&str> {
+    let index = arguments
+        .iter()
+        .position(|argument| argument == "--data-dir")?;
+    arguments.get(index + 1).map(String::as_str)
 }
 
-/// Whether `program` is an app's own, in `Something.app/Contents/MacOS`.
+/// Whether `program` is an app's own, in `Something.app/Contents/MacOS`,
+/// rather than a build run from its folder.
+#[cfg(any(target_os = "macos", test))]
 fn in_app(program: &std::path::Path) -> bool {
     program.parent().is_some_and(|folder| {
         folder.ends_with("Contents/MacOS")
@@ -84,25 +107,46 @@ fn in_app(program: &std::path::Path) -> bool {
     })
 }
 
-/// Why `program` can't be started at sign-in, if it runs from a place gone
-/// by then: Gatekeeper's temporary copy of a downloaded app that wasn't
-/// moved, a disk image on the Mac, or the temporary folder, where Windows
-/// runs a program opened inside a ZIP.
+/// Why `program` can't be started at sign-in on the Mac: it runs from
+/// Gatekeeper's temporary copy of a downloaded app that wasn't moved, or from
+/// a disk image or another read-only place, gone by then or not the app's
+/// own. An app on an external drive is fine.
+#[cfg(target_os = "macos")]
 fn temporary_place(program: &std::path::Path) -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        if program
-            .components()
-            .any(|part| part.as_os_str() == "AppTranslocation")
-        {
-            return Some("Yapfast runs from a temporary copy. Move it to Applications first.");
-        }
-        if program.starts_with("/Volumes") {
-            return Some("Yapfast runs from a disk image. Move it to Applications first.");
-        }
+    if program
+        .components()
+        .any(|part| part.as_os_str() == "AppTranslocation")
+    {
+        return Some("Yapfast runs from a temporary copy. Move it to Applications first.");
     }
-    program
-        .starts_with(std::env::temp_dir())
-        .then_some("Yapfast runs from a temporary folder. Move it somewhere it stays first.")
+    read_only(program).then_some(
+        "Yapfast runs from a disk image, or another place that's read-only. Move it to Applications first.",
+    )
+}
+
+/// Whether `path` is on a file system mounted read-only, as a disk image is.
+#[cfg(target_os = "macos")]
+fn read_only(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut mount = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: a NUL-terminated path, which statvfs only reads, and room for
+    // what it fills in, read only once it says it did.
+    unsafe {
+        libc::statvfs(path.as_ptr(), mount.as_mut_ptr()) == 0
+            && mount.assume_init().f_flag & libc::ST_RDONLY != 0
+    }
+}
+
+/// The data folder this Yapfast was given with `--data-dir`, made absolute.
+fn data_folder() -> std::io::Result<Option<String>> {
+    let arguments: Vec<String> = std::env::args().collect();
+    match data_folder_in(&arguments) {
+        Some(folder) => Ok(Some(path_text(std::path::absolute(folder)?)?)),
+        None => Ok(None),
+    }
 }
 
 /// What starts Yapfast in the tray, with the data folder this one uses.
@@ -117,18 +161,13 @@ fn command() -> std::io::Result<Vec<String>> {
         }
         _ => exe,
     };
+    #[cfg(target_os = "macos")]
     if let Some(place) = temporary_place(&program) {
         return Err(std::io::Error::other(place));
     }
     let mut command = vec![path_text(program)?, "--background".to_owned()];
-    let arguments: Vec<String> = std::env::args().collect();
-    if let Some(index) = arguments
-        .iter()
-        .position(|argument| argument == "--data-dir")
-        && let Some(folder) = arguments.get(index + 1)
-    {
-        let folder = std::path::absolute(folder)?;
-        command.extend(["--data-dir".to_owned(), path_text(folder)?]);
+    if let Some(folder) = data_folder()? {
+        command.extend(["--data-dir".to_owned(), folder]);
     }
     Ok(command)
 }
@@ -148,50 +187,9 @@ fn path_text(path: PathBuf) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// A Run value's arguments, split as Windows splits a command line: quotes
-/// group, and backslashes count only before a quote, two for each one kept.
-#[cfg(any(windows, test))]
-fn windows_arguments(line: &str) -> Vec<String> {
-    let mut arguments = Vec::new();
-    let mut argument = String::new();
-    let (mut started, mut quoted, mut backslashes) = (false, false, 0);
-    for character in line.chars() {
-        if character == '\\' {
-            backslashes += 1;
-            started = true;
-            continue;
-        }
-        if character == '"' {
-            argument.extend(std::iter::repeat_n('\\', backslashes / 2));
-            match backslashes % 2 {
-                1 => argument.push('"'),
-                _ => quoted = !quoted,
-            }
-            started = true;
-        } else {
-            argument.extend(std::iter::repeat_n('\\', backslashes));
-            if matches!(character, ' ' | '\t') && !quoted {
-                if started {
-                    arguments.push(std::mem::take(&mut argument));
-                }
-                started = false;
-            } else {
-                argument.push(character);
-                started = true;
-            }
-        }
-        backslashes = 0;
-    }
-    argument.extend(std::iter::repeat_n('\\', backslashes));
-    if started {
-        arguments.push(argument);
-    }
-    arguments
-}
-
 /// One argument of a desktop entry's Exec line, quoted as the Desktop Entry
 /// specification asks when it holds anything but plain characters.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn desktop_argument(argument: &str) -> String {
     let argument = argument.replace('%', "%%");
     let plain = !argument.is_empty()
@@ -210,36 +208,6 @@ fn desktop_argument(argument: &str) -> String {
     }
     quoted.push('"');
     quoted
-}
-
-/// An Exec line's arguments, as `desktop_argument` quotes them; `None` for
-/// one it couldn't have written.
-#[cfg(any(target_os = "linux", test))]
-fn desktop_arguments(exec: &str) -> Option<Vec<String>> {
-    let mut arguments = Vec::new();
-    let mut characters = exec.chars().peekable();
-    loop {
-        while characters.next_if_eq(&' ').is_some() {}
-        let Some(first) = characters.next() else {
-            return Some(arguments);
-        };
-        let mut argument = String::new();
-        if first == '"' {
-            loop {
-                match characters.next()? {
-                    '"' => break,
-                    '\\' => argument.push(characters.next()?),
-                    character => argument.push(character),
-                }
-            }
-        } else {
-            argument.push(first);
-            while let Some(character) = characters.next_if(|&character| character != ' ') {
-                argument.push(character);
-            }
-        }
-        arguments.push(argument.replace("%%", "%"));
-    }
 }
 
 /// An agent's arguments, as `launch_agent` writes them.
@@ -390,16 +358,6 @@ mod linux {
         }
     }
 
-    pub fn recorded() -> Option<Vec<String>> {
-        entry_command(&config()?)
-    }
-
-    pub(super) fn entry_command(config: &Path) -> Option<Vec<String>> {
-        let entry = std::fs::read_to_string(entry(config)).ok()?;
-        let exec = entry.lines().find_map(|line| line.strip_prefix("Exec="))?;
-        super::desktop_arguments(exec)
-    }
-
     /// `$XDG_CONFIG_HOME`, or `~/.config`.
     fn config() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
@@ -463,7 +421,6 @@ mod linux {
                 r#"Exec="/opt/Yapfast Builds/yapfast" --background --data-dir "/home/a/100%% \$data""#
             ));
             assert!(text.contains("Name=Yapfast\n"));
-            assert_eq!(entry_command(config.path()).as_deref(), Some(&command[..]));
         }
 
         #[test]
@@ -529,16 +486,6 @@ mod windows {
     pub fn remove() -> io::Result<()> {
         delete(RUN)?;
         delete(APPROVED)
-    }
-
-    pub fn recorded() -> Option<Vec<String>> {
-        let value = query(RUN, RRF_RT_REG_SZ)?;
-        let line: Vec<u16> = value
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .take_while(|&unit| unit != 0)
-            .collect();
-        Some(super::windows_arguments(&String::from_utf16_lossy(&line)))
     }
 
     fn delete(key: &str) -> io::Result<()> {
@@ -870,10 +817,6 @@ mod none {
     pub fn remove() -> std::io::Result<()> {
         Ok(())
     }
-
-    pub fn recorded() -> Option<Vec<String>> {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -883,7 +826,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_back_the_command_each_entry_holds() {
+    fn reads_back_the_arguments_an_agent_holds() {
         let command = [
             "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast",
             "--background",
@@ -895,78 +838,39 @@ mod tests {
             agent_arguments(&launch_agent(&command)).as_deref(),
             Some(&command[..])
         );
-        let command = [
-            "/opt/Yapfast Builds/100% \"yap\" $fast",
-            "--background",
-            "--data-dir",
-            r"/home/a/back\slash",
-            "",
-        ]
-        .map(String::from);
-        let exec: Vec<String> = command.iter().map(|it| desktop_argument(it)).collect();
-        assert_eq!(
-            desktop_arguments(&exec.join(" ")).as_deref(),
-            Some(&command[..])
-        );
-        assert_eq!(desktop_arguments(r#""unclosed"#), None);
-        let command = [
-            r"C:\Program Files\Yapfast\yapfast.exe",
-            "--background",
-            "--data-dir",
-            r"C:\A B\",
-            r#"say "hi""#,
-            "",
-        ];
-        let line = command.map(windows_argument).join(" ");
-        assert_eq!(windows_arguments(&line), command, "{line}");
-        // As the installer writes it.
-        assert_eq!(
-            windows_arguments(r#""C:\Users\A\Programs\Yapfast\yapfast.exe" --background"#),
-            [r"C:\Users\A\Programs\Yapfast\yapfast.exe", "--background"]
-        );
     }
 
     #[test]
-    fn an_installed_copy_takes_over_an_entry_that_starts_another() {
-        let new = [
-            if cfg!(target_os = "macos") {
-                "/Applications/Yapfast.app/Contents/MacOS/yapfast"
-            } else {
-                "/opt/yapfast-1.1/yapfast"
-            },
-            "--background",
-        ]
-        .map(String::from);
-        let old = ["/opt/yapfast-1.0/yapfast", "--background"].map(String::from);
-        assert!(takes_over(Some(&old), &new), "an update to a new folder");
-        assert!(!takes_over(Some(&new), &new));
-        let mut with_data = new.to_vec();
-        with_data.extend(["--data-dir".to_owned(), "/data".to_owned()]);
-        assert!(takes_over(Some(&new), &with_data), "this one's data folder");
-        assert!(takes_over(None, &new), "an entry it can't read");
-        assert!(in_app(Path::new(
-            "/Applications/Yapfast.app/Contents/MacOS/yapfast"
-        )));
+    fn a_moved_app_takes_over_the_entry_of_its_own_data_folder() {
+        let entry = |arguments: &[&str]| arguments.iter().map(|it| it.to_string()).collect();
+        let old = "/Applications/Yapfast.app/Contents/MacOS/yapfast";
+        let moved = "/Users/a/Apps/Yapfast.app/Contents/MacOS/yapfast";
+        let plain: Vec<String> = entry(&[old, "--background"]);
+        assert!(takes_over(&plain, moved, None));
+        assert!(!takes_over(&plain, old, None), "it names this one");
+        assert!(
+            !takes_over(&plain, moved, Some("/data")),
+            "another data folder"
+        );
+        let with_data: Vec<String> = entry(&[old, "--background", "--data-dir", "/data"]);
+        assert!(takes_over(&with_data, moved, Some("/data")));
+        assert!(!takes_over(&with_data, moved, None));
+        assert_eq!(data_folder_in(&with_data), Some("/data"));
+        assert!(in_app(Path::new(old)));
         assert!(!in_app(Path::new("/Users/a/yapfast/target/fast/yapfast")));
-    }
-
-    #[test]
-    fn a_copy_in_the_temporary_folder_cant_be_started_at_sign_in() {
-        let zip = std::env::temp_dir().join("Temp1_Yapfast.zip");
-        assert!(temporary_place(&zip.join("yapfast.exe")).is_some());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_disk_image_or_a_build_outside_an_app_doesnt_take_it_over() {
-        let app = "Yapfast.app/Contents/MacOS/yapfast";
-        let image = Path::new("/Volumes/Yapfast").join(app);
-        assert!(temporary_place(&image).is_some());
-        let translocated = Path::new("/private/var/folders/x/AppTranslocation/1/d").join(app);
+    fn a_copy_on_a_temporary_or_read_only_place_cant_be_started_at_sign_in() {
+        let translocated = Path::new("/private/var/folders/x/AppTranslocation/1/d")
+            .join("Yapfast.app/Contents/MacOS/yapfast");
         assert!(temporary_place(&translocated).is_some());
-        assert!(temporary_place(&Path::new("/Applications").join(app)).is_none());
-        let build = ["/Users/a/yapfast/target/fast/yapfast".to_owned()];
-        assert!(!takes_over(None, &build));
+        // macOS mounts its own system volume read-only.
+        assert!(read_only(Path::new("/usr/bin/true")));
+        assert!(temporary_place(Path::new("/usr/bin/true")).is_some());
+        assert!(!read_only(&std::env::temp_dir()));
+        assert!(temporary_place(&std::env::temp_dir()).is_none());
     }
 
     #[test]

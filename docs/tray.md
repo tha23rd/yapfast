@@ -37,23 +37,26 @@ waiting come down to the latest, so clicks faster than macOS answers end where
 the switch was left. Each request carries how many times the switch had
 turned, and an answer a later turn overtook changes nothing.
 
-Each start, outside the preview, points an entry that's on at this Yapfast
-when the command it holds is another: after an update to a new folder, as the
-Windows ZIP, an AppImage and Nix each give a version, after a move, or when
-it lacks this Yapfast's `--data-dir`. A copy that runs from somewhere gone by
-the next sign-in can't take it over, nor be turned on: a disk image or
-Gatekeeper's temporary copy of an app not moved out of Downloads on the Mac,
-or the temporary folder, as a program Windows opens inside a ZIP. On the Mac
-a build outside an app, as from `cargo run`, leaves it be too. That only
-writes the entry, and never opens anything. An AppImage's entry names the
-AppImage, not its temporary mount. A path with a control character, which an
-entry's line or XML couldn't hold, writes none. Linux's and the Mac's entries
-reach the disk whole before they replace the old, and a copy a write cut short
-left beside them goes with the next. The preview, and platforms without any of
-these, don't show the switch. The Windows installer's "Start Yapfast
-automatically when Windows starts" writes the same value when there's none,
-so an update leaves the one there, with its `--data-dir` and Task Manager's
-"off", and uninstalling removes it.
+On Linux and Windows each start, outside the preview, rewrites an entry
+that's on with this Yapfast's path, so moving its folder or an update keeps it
+working; the entry keeps `--data-dir` if Yapfast had one, and an AppImage's
+entry names the AppImage, not its temporary mount. That's upstream's design,
+which the Mac's work leaves as it was. On the Mac a start rewrites only the
+program of an entry that names another, as after the app moved or an update
+put it somewhere new, and only when this copy is an app on a place that
+stays, not on a disk image or another read-only mount, Gatekeeper's temporary
+copy of an app not moved out of Downloads, or a build outside an app, as from
+`cargo run`; and only when it uses the data folder the entry names, none for
+the default. The entry's other arguments keep, only the switch adds or drops
+`--data-dir`, and an entry that's right isn't written again, so macOS doesn't
+say Background Items Added again. The switch can't turn it on from those
+places either, and says why. That only writes the entry, and never opens
+anything. A path with a control character, which an entry's line or XML
+couldn't hold, writes none. Linux's and the Mac's entries reach the disk whole
+before they replace the old, and a copy a write cut short left beside them
+goes with the next. The preview, and platforms without any of these, don't
+show the switch. The Windows installer's "Start Yapfast automatically when
+Windows starts" writes the same value, and uninstalling removes it.
 
 `--background` restores the saved session and goes to the tray without
 showing the window, or shows it when there's no session to restore, since
@@ -141,16 +144,12 @@ The bar is a cross-build and Wine (`scripts/build-windows`, see
   off there shows as off in Settings;
 - the installer's "Start Yapfast automatically when Windows starts" does the same, an update
   installs over a running Yapfast, and uninstalling leaves nothing in Startup
-  apps;
-- an update over an entry with `--data-dir`, or one Task Manager has off,
-  leaves it so.
+  apps.
 
 The registry side is checked under Wine: `autostart::windows::tests`, ignored
 since it writes the current user's Run key, passes with a throwaway
 `WINEPREFIX`, and the installer installs, updates over Task Manager's "off",
-and uninstalls under `xvfb-run` in one, leaving the data folder. That was
-before the installer left a value already there alone, which isn't checked
-under Wine yet.
+and uninstalls under `xvfb-run` in one, leaving the data folder.
 
 ## macOS
 
@@ -258,10 +257,12 @@ this build, outside Applications:
   ignored since it writes `~/Library/LaunchAgents`, turns it on, reads it
   back, sees the test, a build outside an app, leave it be, and turns it off.
 - Started against a test server on 127.0.0.1, with an entry naming another
-  copy that's still there, without `--data-dir`, Yapfast rewrote it with its
-  own program and `--data-dir`, and `statusForLegacyURL:` said enabled. The
-  same app run from a mounted disk image left it be, and its switch said
-  "Yapfast runs from a disk image. Move it to Applications first."
+  copy that's still there, with a `--renderer software` added by hand and the
+  same data folder, Yapfast changed only the program, and a second start left
+  the file untouched; with another data folder, or one where the entry had
+  the default, it left the entry be. The same app run from a mounted disk
+  image, read-only, left it be, and its switch said "Yapfast runs from a disk
+  image, or another place that's read-only. Move it to Applications first."
 - Through a probe build's control commands, doing what the switch, another
   setting and opening Settings do: turning it on wrote the entry, waited
   0.7 s for "enabled", and disabled relaunching at sign-in; an entry deleted,

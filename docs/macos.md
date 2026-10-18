@@ -27,9 +27,12 @@ Discord token and a launchd agent for starting at sign-in.
 Settings → Advanced → "Start when you sign in" writes
 `~/Library/LaunchAgents/io.github.yapfast.Yapfast.plist`, which starts Yapfast
 in the menu bar as the person signs in; turned off in System Settings → General
-→ Login Items, it shows as off ([the tray](tray.md#macos) has how). The file
-outlives the app, so turn the switch off before deleting Yapfast, or delete
-the file after.
+→ Login Items, it shows as off ([the tray](tray.md#macos) has how). Moved, or
+updated to a new place, the app takes the file over as it starts, changing
+only the program it names, if it uses the same data folder; run from the disk
+image, or another read-only place, it can't be turned on, and says so. The
+file outlives the app, so turn the switch off before deleting Yapfast, or
+delete the file after.
 
 Opened from the Finder or the Dock, or at sign-in, Yapfast's output goes
 nowhere, so it writes its diagnostics to `yapfast.log` in its data folder,

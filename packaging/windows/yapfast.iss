@@ -71,24 +71,12 @@ Name: "{autoprograms}\Yapfast"; Filename: "{app}\yapfast.exe"
 Name: "{autodesktop}\Yapfast"; Filename: "{app}\yapfast.exe"; Tasks: desktopicon
 
 [Registry]
-; Chosen here, it starts even if Task Manager had turned it off before; but an
-; update over a value already there leaves what Task Manager says of it. This
-; goes first, to see the value as it was before installing.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "Yapfast"; Flags: deletevalue dontcreatekey; Tasks: startonsignin; Check: NoRunValue
-; An update leaves a value already there as it is, with the --data-dir
-; Yapfast may have written into it.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Yapfast"; ValueData: """{app}\yapfast.exe"" --background"; Flags: createvalueifdoesntexist; Tasks: startonsignin
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Yapfast"; ValueData: """{app}\yapfast.exe"" --background"; Tasks: startonsignin
+; Chosen here, it starts even if Task Manager had turned it off before.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "Yapfast"; Flags: deletevalue dontcreatekey; Tasks: startonsignin
 ; Uninstalling stops starting at sign-in, however it was turned on.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Yapfast"; Flags: uninsdeletevalue dontcreatekey
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "Yapfast"; Flags: uninsdeletevalue dontcreatekey
 
 [Run]
 Filename: "{app}\yapfast.exe"; Description: "{cm:LaunchProgram,Yapfast}"; Flags: nowait postinstall skipifsilent
-
-[Code]
-// No Run value starts Yapfast at sign-in yet, as before a first install.
-function NoRunValue: Boolean;
-begin
-  Result := not RegValueExists(HKEY_CURRENT_USER,
-    'Software\Microsoft\Windows\CurrentVersion\Run', 'Yapfast');
-end;
