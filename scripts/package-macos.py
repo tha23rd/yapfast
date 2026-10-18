@@ -165,8 +165,12 @@ def main():
             build["homeserver_default"] = "https://matrix.org"
         (resources / "BUILD.json").write_text(json.dumps(build, indent=2) + "\n", encoding="utf-8")
         # Apple silicon runs only signed code. Signing seals the bundle, so
-        # nothing in it may change after.
-        subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", str(app)],
+        # nothing in it may change after. An ad hoc signature's own designated
+        # requirement is the build's hash, so macOS would take each update for
+        # another app and ask again for the microphone and the Keychain item;
+        # one on the bundle identifier keeps them. See docs/macos.md.
+        subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none",
+                        '-r=designated => identifier "io.github.yapfast.Yapfast"', str(app)],
                        check=True, timeout=300)
         subprocess.run(["codesign", "--verify", "--strict", str(app)], check=True, timeout=300)
         # Dragging the app onto Applications installs it.

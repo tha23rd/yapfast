@@ -57,6 +57,22 @@ silicon requires of all code, and packs it with a link to Applications into
 snapshot and `SHA256SUMS.txt`. Packaging needs Python 3.11 or newer; the
 script runs it with `uv` where there is one, as macOS's own Python is 3.9.
 
+An ad hoc signature's own designated requirement, which macOS checks an app
+against to know it again, is the hash of that one build. The microphone
+permission and the Keychain item holding the Discord token are kept for the
+app that meets it, so after each update macOS would ask for both again. The
+signature names its own instead, which each build meets, as
+`codesign -d -r- Yapfast.app` shows:
+
+```
+designated => identifier "io.github.yapfast.Yapfast"
+```
+
+The trade-off: with no certificate in it, any app that claims the identifier
+meets it too, and so gets the microphone and the Discord token without
+asking. A Developer ID signature would add its certificate to the
+requirement.
+
 A development build needs only `PROTOC`: Skia's and LiveKit's build scripts
 download their archives themselves.
 
