@@ -383,6 +383,12 @@ impl Application {
 
     pub(super) fn open(&mut self, id: String) -> Vec<Effect> {
         let Some(room) = self.state.rooms.iter().find(|room| room.id == id) else {
+            // Asked for before Discord's lists came, as by a notification
+            // that started Yapfast on macOS: it opens once they have it.
+            if !self.state.discord_online && !self.state.preview {
+                self.pending_open = Some(id);
+                return vec![];
+            }
             return self.open_thread(id, false);
         };
         let navigation = if room.direct {

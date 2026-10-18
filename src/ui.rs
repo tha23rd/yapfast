@@ -97,15 +97,22 @@ pub fn run(
     };
     decode_into_slint_buffers();
     pictures::make_frames_in_slint_buffers();
-    // Request OpenGL explicitly so Slint cannot silently replace a failed GPU
-    // surface; Yapfast owns the fallback and tells the user about it.
+    // Request OpenGL explicitly, or on the Mac, where OpenGL is a layer over
+    // Metal, Metal, so Slint cannot silently replace a failed GPU surface;
+    // Yapfast owns the fallback and tells the user about it.
+    let metal = cfg!(target_os = "macos") && plan.renderer == graphics::Renderer::Gpu;
     let renderer = match plan.renderer {
+        graphics::Renderer::Gpu if metal => "skia",
         graphics::Renderer::Gpu => "skia-opengl",
         graphics::Renderer::Software => "skia-software",
     };
-    slint::BackendSelector::new()
+    let mut selector = slint::BackendSelector::new()
         .backend_name("winit".into())
-        .renderer_name(renderer.into())
+        .renderer_name(renderer.into());
+    if metal {
+        selector = selector.require_metal();
+    }
+    selector
         .with_winit_window_attributes_hook(crate::icon::attributes)
         .select()
         .context("could not select the Slint desktop backend")?;
@@ -383,22 +390,40 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                 // minimizes it.
                 #[cfg(target_os = "macos")]
                 {
-                    use slint::winit_030::winit::{event::ElementState, keyboard::Key};
+                    use slint::winit_030::winit::{
+                        event::ElementState,
+                        keyboard::{Key, KeyCode, PhysicalKey},
+                    };
                     match event {
                         WindowEvent::ModifiersChanged(modifiers) => {
                             command = modifiers.state().super_key();
                         }
                         WindowEvent::KeyboardInput { event, .. }
-                            if command && event.state == ElementState::Pressed =>
+                            if command && event.state == ElementState::Pressed && !event.repeat =>
                         {
-                            match event.logical_key.as_ref() {
-                                Key::Character("w") => {
+                            // The letter typed, in any case; where the layout
+                            // types no Latin letter, the key's place.
+                            let typed = match event.logical_key.as_ref() {
+                                Key::Character(typed) => typed
+                                    .chars()
+                                    .next()
+                                    .filter(char::is_ascii_alphabetic)
+                                    .map(|letter| letter.to_ascii_lowercase()),
+                                _ => None,
+                            };
+                            let letter = typed.or(match event.physical_key {
+                                PhysicalKey::Code(KeyCode::KeyW) => Some('w'),
+                                PhysicalKey::Code(KeyCode::KeyM) => Some('m'),
+                                _ => None,
+                            });
+                            match letter {
+                                Some('w') => {
                                     slint_window.dispatch_event(
                                         slint::platform::WindowEvent::CloseRequested,
                                     );
                                     return EventResult::PreventDefault;
                                 }
-                                Key::Character("m") => {
+                                Some('m') => {
                                     slint_window.set_minimized(true);
                                     return EventResult::PreventDefault;
                                 }

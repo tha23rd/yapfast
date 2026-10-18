@@ -85,6 +85,8 @@ fn logo(size: u32, unread: bool) -> Option<slint::SharedPixelBuffer<slint::Rgba8
 use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
+#[cfg(target_os = "macos")]
+pub use macos::activate;
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 use none as platform;
 #[cfg(windows)]
@@ -539,10 +541,12 @@ mod macos {
         sel,
     };
     use objc2_app_kit::{
-        NSApplication, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
-        NSVariableStatusItemLength,
+        NSApplication, NSApplicationTerminateReply, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+        NSStatusItem, NSVariableStatusItemLength,
     };
-    use objc2_foundation::{NSData, NSObject, NSSize, NSString};
+    use objc2_foundation::{
+        NSAppleEventDescriptor, NSAppleEventManager, NSData, NSObject, NSSize, NSString,
+    };
 
     use super::{Choice, Shown};
 
@@ -636,7 +640,7 @@ mod macos {
                 button.setImage(icons[0].as_deref());
                 button.setToolTip(Some(&NSString::from_str("Yapfast")));
             }
-            reopen_from_dock(mtm, chosen);
+            teach_delegate(mtm, chosen);
             Some(Self {
                 item,
                 disconnect,
@@ -684,51 +688,108 @@ mod macos {
         Some(image)
     }
 
-    /// Clicking the Dock icon while the window is closed opens it, as Mac
-    /// apps do. winit's application delegate doesn't answer that question,
-    /// so Yapfast teaches it to.
-    fn reopen_from_dock(mtm: MainThreadMarker, chosen: fn(Choice)) {
-        unsafe extern "C-unwind" fn reopen(
+    /// Makes Yapfast the active app, showing it if hidden, so a window it
+    /// opens comes in front of the rest.
+    pub fn activate() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        app.unhide(None);
+        // `activate`, which replaces it, needs macOS 14.
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+
+    /// Teaches winit's application delegate two things Mac apps do, which it
+    /// doesn't: clicking the Dock icon opens the window, and quitting from
+    /// the app menu or the Dock quits as the menu bar icon's Quit does,
+    /// leaving a call and keeping what Yapfast saves, rather than ending the
+    /// process where it stands.
+    fn teach_delegate(mtm: MainThreadMarker, chosen: fn(Choice)) {
+        /// Opens the window, whether or not one shows: AppKit counts some
+        /// windows that aren't Yapfast's, and opening an open one brings it
+        /// forward. Answering no keeps AppKit from restoring a minimized
+        /// window again after.
+        unsafe extern "C-unwind" fn reopen(_: &AnyObject, _: Sel, _: &AnyObject, _: Bool) -> Bool {
+            if let Some(chosen) = CHOSEN.get() {
+                choose(chosen, Choice::Open);
+            }
+            Bool::NO
+        }
+        /// Cancels AppKit's quitting for Yapfast's own, which ends the
+        /// process once done, unless the Mac is logging out, restarting or
+        /// shutting down, which cancelling would stop.
+        unsafe extern "C-unwind" fn terminate(
             _: &AnyObject,
             _: Sel,
             _: &AnyObject,
-            visible: Bool,
-        ) -> Bool {
-            if !visible.as_bool()
-                && let Some(chosen) = CHOSEN.get()
-            {
-                choose(chosen, Choice::Open);
+        ) -> NSApplicationTerminateReply {
+            match CHOSEN.get() {
+                Some(chosen) if !powering_off() => {
+                    choose(chosen, Choice::Quit);
+                    NSApplicationTerminateReply::TerminateCancel
+                }
+                _ => NSApplicationTerminateReply::TerminateNow,
             }
-            Bool::YES
         }
         CHOSEN.set(Some(chosen));
         let Some(delegate) = NSApplication::sharedApplication(mtm).delegate() else {
             return;
         };
         let delegate: &AnyObject = (*delegate).as_ref();
-        let types = format!(
-            "{}{}{}{}{}\0",
-            Bool::ENCODING,
-            <&AnyObject>::ENCODING,
-            Sel::ENCODING,
-            <&AnyObject>::ENCODING,
-            Bool::ENCODING
-        );
-        let reopen: unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, Bool) -> Bool = reopen;
-        // SAFETY: `types` describes `reopen`, which AppKit calls with the
-        // delegate, the selector, the application and whether a window shows.
-        // Adding a method winit's class already has does nothing.
-        unsafe {
-            ffi::class_addMethod(
-                std::ptr::from_ref::<AnyClass>(delegate.class()).cast_mut(),
+        let class = std::ptr::from_ref::<AnyClass>(delegate.class()).cast_mut();
+        type Reopen = unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, Bool) -> Bool;
+        type Terminate =
+            unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject) -> NSApplicationTerminateReply;
+        let object = <&AnyObject>::ENCODING;
+        let methods = [
+            (
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
-                std::mem::transmute::<
-                    unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, Bool) -> Bool,
-                    Imp,
-                >(reopen),
-                types.as_ptr().cast(),
-            );
+                // SAFETY: the same function, with its arguments as the
+                // encoding below says.
+                unsafe { std::mem::transmute::<Reopen, Imp>(reopen) },
+                format!(
+                    "{}{object}{}{object}{}\0",
+                    Bool::ENCODING,
+                    Sel::ENCODING,
+                    Bool::ENCODING
+                ),
+            ),
+            (
+                sel!(applicationShouldTerminate:),
+                // SAFETY: as above.
+                unsafe { std::mem::transmute::<Terminate, Imp>(terminate) },
+                format!(
+                    "{}{object}{}{object}\0",
+                    NSApplicationTerminateReply::ENCODING,
+                    Sel::ENCODING
+                ),
+            ),
+        ];
+        for (selector, method, types) in methods {
+            // SAFETY: `types` describes `method`, which AppKit calls with the
+            // delegate, the selector and the application, and for reopening
+            // whether a window shows. Adding a method winit's class already
+            // has does nothing.
+            unsafe { ffi::class_addMethod(class, selector, method, types.as_ptr().cast()) };
         }
+    }
+
+    /// Whether the quit AppKit asks about is the Mac logging out, restarting
+    /// or shutting down, whose quit event says why.
+    fn powering_off() -> bool {
+        const REASON: u32 = u32::from_be_bytes(*b"why?");
+        NSAppleEventManager::sharedAppleEventManager()
+            .currentAppleEvent()
+            .is_some_and(|event| {
+                // SAFETY: the method takes an AEKeyword, a four-character
+                // code, and returns the attribute or nil. objc2's binding
+                // needs all of Core Services for its type.
+                let reason: Option<Retained<NSAppleEventDescriptor>> =
+                    unsafe { msg_send![&*event, attributeDescriptorForKeyword: REASON] };
+                reason.is_some()
+            })
     }
 }
 

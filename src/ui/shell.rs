@@ -215,6 +215,10 @@ impl Shell {
 
     /// Brings the window to the front, making it again if it was closed.
     pub(super) fn open(self: &Rc<Self>) -> Option<YapfastWindow> {
+        // A click in the menu bar or Notification Center doesn't make
+        // Yapfast the active app, whose window would open behind the rest.
+        #[cfg(target_os = "macos")]
+        crate::tray::activate();
         if let Some(window) = self.window() {
             let _ = window.show();
             window.window().set_minimized(false);

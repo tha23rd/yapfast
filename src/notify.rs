@@ -75,6 +75,8 @@ fn body(alert: &Alert, style: Style) -> String {
 /// clicking one in it opens the conversation here.
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
     use block2::RcBlock;
     use objc2::{
         AllocAnyThread, DefinedClass, define_class, msg_send,
@@ -179,20 +181,21 @@ mod macos {
             // Groups a conversation's notifications, and says which to open.
             // Yapfast plays its own sounds, so it asks for none.
             content.setThreadIdentifier(&NSString::from_str(&alert.room));
-            // Each its own, so none replaces another.
-            let made = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
+            // Each its own, so none replaces another, this start or the last.
+            static SHOWN: AtomicU64 = AtomicU64::new(0);
+            let started = std::process::id();
+            let shown = SHOWN.fetch_add(1, Ordering::Relaxed);
             let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-                &NSString::from_str(&made.to_string()),
+                &NSString::from_str(&format!("{started}-{shown}")),
                 &content,
                 None,
             );
             self.center.addNotificationRequest_withCompletionHandler(
                 &request,
                 Some(&RcBlock::new(|error: *mut NSError| {
-                    if !error.is_null() {
+                    // Once: with notifications turned off, each fails.
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !error.is_null() && !WARNED.swap(true, Ordering::Relaxed) {
                         tracing::warn!("could not show a notification");
                     }
                 })),
