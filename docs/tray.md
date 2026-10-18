@@ -35,7 +35,9 @@ Background Task Management and turning it on waits for its answer
 (`src/ui/sign_in.rs`). It takes requests from a channel, in order; the ones
 waiting come down to the latest, so clicks faster than macOS answers end where
 the switch was left. Each request carries how many times the switch had
-turned, and an answer a later turn overtook changes nothing.
+turned, and an answer a later turn overtook changes nothing. Should the
+thread end, as by a panic, the next request starts another. A read that finds
+it on clears what the switch said went wrong.
 
 On Linux and Windows each start, outside the preview, rewrites an entry
 that's on with this Yapfast's path, so moving its folder or an update keeps it

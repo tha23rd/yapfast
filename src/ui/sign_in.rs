@@ -52,17 +52,36 @@ pub(super) fn sign_in_entry(window: &YapfastWindow, what: SignIn) {
         turns: TURNS.get(),
         window: window.as_weak(),
     };
-    WORK.with_borrow_mut(|sender| {
+    if !WORK.with_borrow_mut(|sender| send(sender, work, start)) {
+        tracing::warn!("could not reach starting at sign-in");
+    }
+}
+
+/// Sends `work` to the entry's thread, starting it first if it isn't there.
+/// A thread that ended, as by a panic, takes no more work, and a new one
+/// takes it instead. Whether one took it.
+fn send(
+    sender: &mut Option<mpsc::Sender<Work>>,
+    work: Work,
+    start: impl Fn() -> Option<mpsc::Sender<Work>>,
+) -> bool {
+    let mut work = Some(work);
+    for _ in 0..2 {
         if sender.is_none() {
             *sender = start();
         }
-        if !sender
-            .as_ref()
-            .is_some_and(|sender| sender.send(work).is_ok())
-        {
-            tracing::warn!("could not reach starting at sign-in");
+        let (Some(channel), Some(next)) = (sender.as_ref(), work.take()) else {
+            return false;
+        };
+        match channel.send(next) {
+            Ok(()) => return true,
+            Err(mpsc::SendError(unsent)) => {
+                *sender = None;
+                work = Some(unsent);
+            }
         }
-    });
+    }
+    false
 }
 
 /// Starts the entry's thread, which waits for work as long as Yapfast runs.
@@ -148,6 +167,9 @@ fn show(
             tracing::warn!(%error, "could not change starting at sign-in");
             Some(error)
         }
+        // Read again, it's on, as after the person turned it on in System
+        // Settings: what went wrong before is past.
+        None if on => Some(String::new()),
         None => None,
     };
     STARTS_AT_SIGN_IN.set(on);
@@ -205,5 +227,18 @@ mod tests {
         );
         show(2, Some(Ok(true)), true, &window);
         assert!(STARTS_AT_SIGN_IN.get());
+    }
+
+    #[test]
+    fn work_goes_to_a_new_thread_once_the_old_one_ended() {
+        let (dead, ended) = mpsc::channel();
+        drop(ended);
+        let (fresh, waiting) = mpsc::channel();
+        let mut sender = Some(dead);
+        assert!(send(&mut sender, work(SignIn::Read, 0), || Some(
+            fresh.clone()
+        )));
+        assert_eq!(waiting.try_recv().map(|work| work.what), Ok(SignIn::Read));
+        assert!(!send(&mut None, work(SignIn::Read, 0), || None));
     }
 }
