@@ -213,10 +213,26 @@ program is gone, which macOS doesn't check; so only "requires approval"
 counts as off. Turning it on waits up to two seconds for macOS's answer, which
 may be that the person turned it off before. SMAppService is new in macOS 13,
 so Yapfast looks the class up by name, and before 13 the file alone is the
-setting. The other way was `SMAppService.mainApp`, macOS 13's login item for
-the app itself: it passes no arguments, so Yapfast would have to tell a start
-at sign-in from its launch Apple event before `ui::run` decides whether to
-show the window, and it isn't there on macOS 11 or 12.
+setting.
+
+The other ways were SMAppService's own. `SMAppService.mainApp`, the app itself
+as a login item, passes no arguments, so Yapfast would have to tell a start at
+sign-in from its launch Apple event before `ui::run` decides whether to show
+the window. `SMAppService.agent(plistName:)`, an agent inside the app at
+`Contents/Library/LaunchAgents` with `BundleProgram`, which
+`scripts/package-macos.py` would put there, was tried with the ad hoc signed
+app: it registers, reads "enabled", and unregistering ends its job. But
+registering runs a `RunAtLoad` agent at once, a second Yapfast beside the one
+that turned it on; its arguments are fixed in the bundle, so without
+`--data-dir`; and deleting the app left it registered and enabled, its job
+loaded, until an app at the same path unregistered it. A build outside a
+bundle, and macOS 11 and 12, would need the file anyway, so the file stays.
+
+Deleting Yapfast leaves the file: launchd can't start it at each sign-in, and
+Login Items keeps listing it. Turning "Start when you sign in" off before
+deleting Yapfast removes it; after, delete
+`~/Library/LaunchAgents/io.github.yapfast.Yapfast.plist`, and macOS forgets
+it.
 
 Checked on a MacBook Air (M4, macOS 15.3), with the disk image's app carrying
 this build, outside Applications:

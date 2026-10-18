@@ -135,7 +135,8 @@ For Macs with Apple silicon (M1 and newer), on macOS 11 or later.
 Closing the window keeps Yapfast in the menu bar, so messages and calls still
 reach you; click its icon there, or Yapfast in the Dock, to bring it back. To
 have it wait there from the moment you log in, turn on **Settings → Advanced →
-Start when you sign in**. Cameras and Intel Macs aren't covered yet.
+Start when you sign in**; turn it off before you delete Yapfast, or macOS keeps
+trying. Cameras and Intel Macs aren't covered yet.
 
 ## Features
 
