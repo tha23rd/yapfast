@@ -242,20 +242,32 @@ mod tests {
             (0, 0),
             CachingHint::Allow
         ));
-        let painted = pixels
-            .chunks(4)
-            .filter(|pixel| {
-                let color = image.image_info().color_type();
-                let (r, b) = if color == skia_safe::ColorType::BGRA8888 {
-                    (pixel[2], pixel[0])
-                } else {
-                    (pixel[0], pixel[2])
-                };
-                r > 200 && pixel[1] < 80 && b < 80
-            })
-            .count();
+        let color = image.image_info().color_type();
+        let red = |pixel: &[u8]| {
+            let (r, b) = if color == skia_safe::ColorType::BGRA8888 {
+                (pixel[2], pixel[0])
+            } else {
+                (pixel[0], pixel[2])
+            };
+            r > 200 && pixel[1] < 80 && b < 80
+        };
+        let painted = pixels.chunks(4).filter(|pixel| red(pixel)).count();
         // 40 pixel text draws the emoji 1.36 em square.
         assert!((2500..=3300).contains(&painted), "{painted} red pixels");
+        // Its top is BEARING_Y bitmap pixels above the baseline, at 60, and
+        // its foot SIDE below that, at PPEM of them to the 40 pixel em, to
+        // within the pixel Core Text and FreeType round it to differently.
+        let rows: Vec<usize> = (0..100)
+            .filter(|y| pixels[y * 400..(y + 1) * 400].chunks(4).any(red))
+            .collect();
+        let (first, end) = (rows[0] as f32, rows[rows.len() - 1] as f32 + 1.0);
+        let scale = 40.0 / f32::from(emoji_font::PPEM);
+        let top = 60.0 - f32::from(emoji_font::BEARING_Y) * scale;
+        let foot = top + emoji_font::SIDE as f32 * scale;
+        assert!(
+            (first - top).abs() <= 1.0 && (end - foot).abs() <= 1.0,
+            "red from row {first} to {end}, not {top} to {foot}"
+        );
     }
 
     #[test]

@@ -15,14 +15,14 @@ const ASCENDER: i16 = 984;
 const DESCENDER: i16 = -316;
 const LINE_GAP: i16 = 0;
 /// The pixels per em of the bitmaps. Text draws them scaled to its size.
-const PPEM: u8 = 100;
+pub const PPEM: u8 = 100;
 /// The side of each emoji's square bitmap: 1.36 em, Discord's 22 pixels in 16
 /// pixel text. It spans the line, its foot just below the descenders.
 pub const SIDE: u32 = 136;
 const BEARING_X: i8 = 2;
 /// The bitmap's top, in pixels above the baseline. With Satoshi's shallower
 /// descender it was 107.
-const BEARING_Y: i8 = 102;
+pub const BEARING_Y: i8 = 102;
 const ADVANCE: u8 = 140;
 
 /// A font with each PNG of `glyphs`, which must be [`SIDE`] pixels square, at
