@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Draws packaging/macos/Yapfast.icns from packaging/macos/icon.svg, at each
+# size macOS asks for, from 16 px in a list to 1024 px for the Dock on a
+# Retina display.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for size in 16 32 64 128 256 512 1024; do
+    magick -background none -density 144 packaging/macos/icon.svg -resize "${size}x${size}" "PNG32:$work/$size.png"
+done
+python3 - "$work" packaging/macos/Yapfast.icns <<'EOF'
+# An .icns is a header and its pictures, each a PNG under the type that
+# names its size: those with @2x are the same picture for Retina displays.
+import struct
+import sys
+from pathlib import Path
+
+work, output = Path(sys.argv[1]), Path(sys.argv[2])
+types = [("icp4", 16), ("icp5", 32), ("icp6", 64), ("ic07", 128), ("ic08", 256),
+         ("ic09", 512), ("ic10", 1024), ("ic11", 32), ("ic12", 64), ("ic13", 256), ("ic14", 512)]
+entries = b"".join(
+    kind.encode() + struct.pack(">I", 8 + len(png)) + png
+    for kind, size in types
+    for png in [(work / f"{size}.png").read_bytes()]
+)
+output.write_bytes(b"icns" + struct.pack(">I", 8 + len(entries)) + entries)
+EOF

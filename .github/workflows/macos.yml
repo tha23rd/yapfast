@@ -1,0 +1,49 @@
+# Builds the macOS disk image on an Apple silicon runner with
+# scripts/build-macos, for a Mac nobody here has to own; see docs/macos.md.
+name: macOS
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      flavour:
+        description: "discord (the release) or full (with Matrix)"
+        default: discord
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install protobuf
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            .local/macos
+          key: macos-${{ inputs.flavour || 'discord' }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: macos-${{ inputs.flavour || 'discord' }}-
+      - name: Build and package
+        run: scripts/build-macos ${{ inputs.flavour || 'discord' }}
+      - name: Check the package
+        run: |
+          image=$(ls target/dist/macos/*.dmg)
+          mount=$(mktemp -d)
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" "$image"
+          codesign --verify --strict "$mount/Yapfast.app"
+          "$mount/Yapfast.app/Contents/MacOS/yapfast" --smoke-test
+          hdiutil detach -quiet "$mount"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yapfast-macos-arm64-${{ inputs.flavour || 'discord' }}
+          path: target/dist/macos/
+          if-no-files-found: error

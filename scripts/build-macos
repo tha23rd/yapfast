@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Builds the macOS release for Apple silicon on a Mac, into target/dist/macos:
+# Yapfast.app on a disk image, beside the source snapshot. Needs Xcode's
+# command line tools, Rustup and protoc; see docs/building.md.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# The Discord flavour is the release; full adds Matrix, as a separate preview.
+flavour=${1:-discord}
+case $flavour in
+  discord) features=(--no-default-features --features desktop,discord) ;;
+  full) features=() ;;
+  *) echo "usage: scripts/build-macos [discord|full]" >&2; exit 2 ;;
+esac
+target=aarch64-apple-darwin
+native=$PWD/.local/macos
+mkdir -p "$native"
+
+# The native archives the build links, from the same releases as
+# nix/native.nix's, pinned by SHA-256 as Nix pins them.
+fetch() {
+  local url=$1 sha256=$2 file=$3
+  if [[ -f $file && $(shasum -a 256 "$file" | cut -d' ' -f1) == "$sha256" ]]; then
+    return
+  fi
+  curl --fail --location --silent --show-error --output "$file.part" "$url"
+  if [[ $(shasum -a 256 "$file.part" | cut -d' ' -f1) != "$sha256" ]]; then
+    rm "$file.part"
+    echo "$url doesn't match its pinned SHA-256" >&2
+    exit 1
+  fi
+  mv "$file.part" "$file"
+}
+skia=skia-binaries-b7f043e0b1e2a850e702-$target-ganesh-gl-jpegd-jpege-metal-pdf.tar.gz
+fetch "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/$skia" \
+  688dc8a8f81f918cfaaae5f5af44262e75fc5d1a69589735926add090730d16a "$native/$skia"
+webrtc=webrtc-51ef663-mac-arm64-release
+fetch "https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-mac-arm64-release.zip" \
+  f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08 "$native/$webrtc.zip"
+if [[ ! -d $native/$webrtc ]]; then
+  rm -rf "$native/unpacking"
+  unzip -q "$native/$webrtc.zip" -d "$native/unpacking"
+  mv "$native/unpacking/mac-arm64-release" "$native/$webrtc"
+  rmdir "$native/unpacking"
+fi
+export SKIA_BINARIES_URL="file://$native/$skia"
+export LK_CUSTOM_WEBRTC="$native/$webrtc"
+export YAPFAST_WEBRTC_ARCHIVE="$native/$webrtc.zip"
+export PROTOC=${PROTOC:-$(command -v protoc)}
+
+# Source paths that name no folder here.
+source scripts/release-env $target
+# macOS's bash 3.2 counts an empty array as unset.
+cargo build --locked --release --target $target ${features[@]+"${features[@]}"}
+# Packaging needs Python 3.11 or newer, which macOS's own isn't.
+if command -v uv >/dev/null; then
+  uv run --no-project --python 3.12 scripts/package-macos.py --flavour "$flavour"
+else
+  python3 scripts/package-macos.py --flavour "$flavour"
+fi
