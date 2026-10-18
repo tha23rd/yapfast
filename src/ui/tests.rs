@@ -431,6 +431,25 @@ fn preferences_set_the_clock_text_size_previews_and_unmuting() {
 }
 
 #[test]
+fn opening_settings_reads_starting_at_sign_in_again() {
+    i_slint_backend_testing::init_no_event_loop();
+    let window = YapfastWindow::new().unwrap();
+    let checked = Rc::new(Cell::new(0));
+    window.on_check_start_on_sign_in({
+        let checked = checked.clone();
+        move || checked.set(checked.get() + 1)
+    });
+    window.set_autostart_available(true);
+    window.set_settings_open(true);
+    slint::platform::update_timers_and_animations();
+    // The person may have changed it in Task Manager or System Settings.
+    assert_eq!(checked.get(), 1);
+    window.set_settings_open(false);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(checked.get(), 1, "closing them doesn't");
+}
+
+#[test]
 fn starting_in_the_tray_needs_something_to_show_there() {
     let never = || -> bool { panic!("the credential store is read only when it matters") };
     assert!(!starts_hidden(false, false, never));

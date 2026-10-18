@@ -964,6 +964,18 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             state.borrow_mut().delete_theme(&window);
         }
     });
+    let weak = window.as_weak();
+    window.on_start_on_sign_in_changed(move |on| {
+        if let Some(window) = weak.upgrade() {
+            sign_in_entry(&window, SignIn::Turn(on));
+        }
+    });
+    let weak = window.as_weak();
+    window.on_check_start_on_sign_in(move || {
+        if let Some(window) = weak.upgrade() {
+            sign_in_entry(&window, SignIn::Read);
+        }
+    });
     let state = adapter.clone();
     let weak = window.as_weak();
     window.on_preferences_changed(move || {
@@ -1001,16 +1013,6 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         layout.gpu_rendering = window.get_gpu_rendering();
         layout.close_to_tray = Some(window.get_close_to_tray());
         adapter.layout.write(&adapter.root);
-        let start = window.get_start_on_sign_in();
-        if AUTOSTART.get() && start != autostart::enabled() {
-            match autostart::set(start) {
-                Ok(()) => tracing::info!(start, "starting at sign-in changed"),
-                Err(error) => {
-                    tracing::warn!(%error, "could not change starting at sign-in");
-                    window.set_start_on_sign_in(!start);
-                }
-            }
-        }
         let (reply_ping, strip_tracking) =
             (window.get_reply_ping_default(), window.get_strip_tracking());
         adapter.app.dispatch(Action::ReplyPing(reply_ping));

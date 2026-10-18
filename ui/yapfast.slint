@@ -720,8 +720,10 @@ export component YapfastWindow inherits Window {
     /// The settings screen covers the window, showing one section: 0 account, 1 voice and
     /// audio, 2 messages, 3 notifications, 4 Discord, 5 sounds.
     in-out property <bool> settings-open;
-    // Closing settings stops linking Discord there.
+    // Closing settings stops linking Discord there. Opening them reads
+    // starting at sign-in again, which may have changed outside Yapfast.
     changed settings-open => {
+        if self.settings-open { self.check-start-on-sign-in(); }
         if !self.settings-open && self.link-phase != 0 { self.cancel-discord-link(); }
         if !self.settings-open { self.camera-testing = false; }
         if !self.settings-open && self.theme-editor { self.cancel-theme(); }
@@ -770,9 +772,13 @@ export component YapfastWindow inherits Window {
     in-out property <bool> close-to-tray: true;
     in property <bool> tray-available;
     /// Yapfast starts in the tray when the person signs in to their computer,
-    /// where the platform can, outside the preview.
+    /// where the platform can, outside the preview. Only its switch changes
+    /// it, through start-on-sign-in-changed; check-start-on-sign-in reads it
+    /// again, as the person may change it in Task Manager or System Settings.
     in-out property <bool> start-on-sign-in;
     in property <bool> autostart-available;
+    callback start-on-sign-in-changed(bool);
+    callback check-start-on-sign-in();
     callback restart();
     callback preferences-changed();
     /// The built-in themes, and the one shown by its id; choose-theme shows
@@ -2816,6 +2822,7 @@ export component YapfastWindow inherits Window {
             close-to-tray <=> root.close-to-tray; tray-available: root.tray-available;
             start-on-sign-in <=> root.start-on-sign-in; autostart-available: root.autostart-available;
             preferences-changed => { root.preferences-changed(); }
+            start-on-sign-in-changed(on) => { root.start-on-sign-in-changed(on); }
             restart => { root.restart(); }
         }
         if root.settings-section == 4 && !root.discord-linked: DiscordLinkSettings {

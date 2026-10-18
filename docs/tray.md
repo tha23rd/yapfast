@@ -20,25 +20,38 @@ The entry is the setting, not `layout.json`: on Windows a value named
 `Yapfast` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, on Linux
 `io.github.yapfast.Yapfast.desktop` in `$XDG_CONFIG_HOME/autostart`, on macOS
 the launchd agent `~/Library/LaunchAgents/io.github.yapfast.Yapfast.plist`.
-Each window reads it, so turning Yapfast off in Task Manager's Startup apps
-(an odd first byte in `Explorer\StartupApproved\Run`), in System Settings'
-Login Items on macOS 13 and later, or a desktop setting `Hidden=true` or
-deleting the file, shows as off. Turning it on here clears Task Manager's
-record too; on the Mac only the person can turn it on again there, so Yapfast
-opens Login Items for them. Each start, outside the preview, rewrites an entry
-that's on with this Yapfast's path, so moving its folder or an update keeps it
-working. The entry keeps `--data-dir` if Yapfast had one; an AppImage's entry
-names the AppImage, not its temporary mount, and a Mac app Gatekeeper runs
-from a temporary copy, as when it wasn't moved out of Downloads, writes none.
-The preview, and platforms without any of these, don't show the switch. The
+Settings read it as they open, and again when the window comes to the front
+with them open, so turning Yapfast off in Task Manager's Startup apps (an odd
+first byte in `Explorer\StartupApproved\Run`), in System Settings' Login Items
+on macOS 13 and later, or a desktop setting `Hidden=true` or deleting the
+file, shows as off. Only the switch changes it, through a callback of its own;
+a change to any other setting leaves it be. Reading and writing it run on a
+thread of their own, one at a time, as on the Mac each read asks Background
+Task Management. Turning it on here clears Task Manager's record too; on the
+Mac only the person can turn it on again there, so Yapfast opens Login Items
+for them.
+
+Each start, outside the preview, points an entry that's on at this Yapfast
+once the program it names is gone, as after its folder moved; an update in
+place keeps the name. One naming a program that's still there stays, so a
+copy run from a disk image, or another build, doesn't take it over, to name
+nothing once ejected or deleted. That only writes the entry, and never opens
+anything. The entry keeps `--data-dir` if Yapfast had one; an AppImage's entry
+names the AppImage, not its temporary mount. A Mac app Gatekeeper runs from a
+temporary copy, as when it wasn't moved out of Downloads, writes none, nor
+does a path with a control character, which an entry's line or XML couldn't
+hold. Linux's and the Mac's entries reach the disk whole before they replace
+the old, and a copy a write cut short left beside them goes with the next. The
+preview, and platforms without any of these, don't show the switch. The
 Windows installer's "Start Yapfast automatically when Windows starts" writes
 the same value, and uninstalling removes it.
 
 `--background` restores the saved session and goes to the tray without
 showing the window, or shows it when there's no session to restore, since
 signing in needs it. With `--preview` it goes to the tray with the sample
-conversations, which shows a start at sign-in without an account. Windows knows at once whether the icon went into the
-notification area; without it the window shows. On Linux the bus says a
+conversations, which shows a start at sign-in without an account. Windows
+knows at once whether the icon went into the notification area; without it
+the window shows. On Linux the bus says a
 moment later, and a tray that's missing, or goes while the window is closed,
 opens the window. The Mac's menu bar always takes the icon. A window made
 late, from the tray, fails over to Skia Software as the first does when the
@@ -183,30 +196,44 @@ window closes. An accessory app until a window shows would have no Dock icon
 to open it from, an icon that came and went, and winit would still activate
 it.
 
+With "Reopen windows when logging back in", macOS opens the apps left running
+at log-out again, through LaunchServices, as the person signs back in, while
+launchd starts the agent: two would run, one with its window. While the entry
+is on, Yapfast calls `-[NSApplication disableRelaunchOnLogin]`, as Apple
+suggests for an app launchd starts, and `enableRelaunchOnLogin` once it's
+off; AppKit counts the calls, so each goes once.
+
 From macOS 13, System Settings → General → Login Items lists the agent under
 Allow in the Background, with a switch, and macOS says so in a notification,
 Background Items Added, when it's first written.
 `+[SMAppService statusForLegacyURL:]` reads the switch: "requires approval"
 when the person turned it off. A new entry reads "not found" for about a
-second, until macOS has looked it over, then "enabled", so only "requires
-approval" counts as off.
-SMAppService is new in macOS 13, so Yapfast looks the class up by name, and
-before 13 the file alone is the setting. The other way was
-`SMAppService.mainApp`, macOS 13's login item for the app itself: it passes no
-arguments, so Yapfast would have to tell a start at sign-in from its launch
-Apple event before `ui::run` decides whether to show the window, and it isn't
-there on macOS 11 or 12.
+second, until macOS has looked it over, then "enabled", as does one whose
+program is gone, which macOS doesn't check; so only "requires approval"
+counts as off. Turning it on waits up to two seconds for macOS's answer, which
+may be that the person turned it off before. SMAppService is new in macOS 13,
+so Yapfast looks the class up by name, and before 13 the file alone is the
+setting. The other way was `SMAppService.mainApp`, macOS 13's login item for
+the app itself: it passes no arguments, so Yapfast would have to tell a start
+at sign-in from its launch Apple event before `ui::run` decides whether to
+show the window, and it isn't there on macOS 11 or 12.
 
 Checked on a MacBook Air (M4, macOS 15.3), with the disk image's app carrying
 this build, outside Applications:
 
 - `autostart::macos::tests::writes_an_agent_launchd_reads` writes an agent
   that `plutil` reads back; `turns_on_and_off_as_system_settings_sees_it`,
-  ignored since it writes `~/Library/LaunchAgents`, turns it on, points it at
-  the test with `refresh()`, and off.
+  ignored since it writes `~/Library/LaunchAgents`, turns it on, points one
+  whose program is gone at the test with `refresh()`, leaves one whose program
+  is there, and turns it off.
 - Started against a test server on 127.0.0.1, with an entry naming another
   folder, Yapfast rewrote it with its own program and `--data-dir`, and
   `statusForLegacyURL:` said enabled.
+- Through a probe build's control commands, doing what the switch, another
+  setting and opening Settings do: turning it on wrote the entry, waited
+  0.7 s for "enabled", and disabled relaunching at sign-in; an entry deleted,
+  or written, outside Yapfast stayed so as another setting changed; opening
+  Settings read it again; turning it off removed it and enabled relaunching.
 - `launchctl bootstrap` of that entry, with `--preview` and a data folder of
   its own, as signing in loads it: launchd started Yapfast, which had only its
   menu bar icon on screen, no window, was responsible for itself, and logged
@@ -214,9 +241,11 @@ this build, outside Applications:
   through `-[NSApplication sendEvent:]`, quit it through
   `applicationShouldTerminate:` with exit code 0; without the app menu it did
   nothing. NSRunningApplication's `terminate`, as Quit in the Dock does, quit
-  it the same way, and launchd didn't start it again.
-- Turning it off in System Settings, and a real sign-in, need someone at the
-  Mac.
+  it the same way, and launchd didn't start it again. The screen was locked,
+  so loginwindow stayed in front, with this build and the one before.
+- The app in front keeping the keyboard at an unlocked screen, turning it off
+  in System Settings, how Login Items names an ad hoc signed app's entry, and
+  a real log-out and sign-in need someone at the Mac.
 
 ## Testing
 

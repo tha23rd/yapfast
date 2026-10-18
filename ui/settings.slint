@@ -835,6 +835,9 @@ export component AdvancedSettings inherits VerticalLayout {
     in-out property <bool> start-on-sign-in;
     in property <bool> autostart-available;
     callback preferences-changed;
+    // Only its own switch changes starting at sign-in, which the person may
+    // also change in Task Manager or System Settings.
+    callback start-on-sign-in-changed(bool);
     callback restart;
     spacing: 16px;
     SettingsTitle { text: "Advanced"; }
@@ -842,7 +845,7 @@ export component AdvancedSettings inherits VerticalLayout {
         text: "Start when you sign in";
         description: "Yapfast starts in the system tray when you sign in to your computer, so messages and calls reach you.";
         checked <=> root.start-on-sign-in;
-        toggled => { root.preferences-changed(); }
+        toggled(on) => { root.start-on-sign-in-changed(on); }
     }
     SettingsSwitch {
         text: "Close to tray";

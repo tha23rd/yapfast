@@ -6,6 +6,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+pub use macos::{open_login_items, reopen_at_sign_in};
+
 /// Whether this platform can start Yapfast at sign-in.
 pub const SUPPORTED: bool = cfg!(any(target_os = "linux", windows, target_os = "macos"));
 
@@ -14,12 +17,14 @@ pub const SUPPORTED: bool = cfg!(any(target_os = "linux", windows, target_os = "
 #[cfg(windows)]
 const NAME: &str = "Yapfast";
 
-/// Whether Yapfast starts when the person signs in.
+/// Whether Yapfast starts when the person signs in. On macOS this asks
+/// Background Task Management, so it's for a thread other than the UI's.
 pub fn enabled() -> bool {
     platform::enabled()
 }
 
-/// Starts Yapfast at sign-in, or stops it.
+/// Starts Yapfast at sign-in, or stops it. On macOS 13 and later System
+/// Settings can still have it off after, as `enabled` then says.
 pub fn set(on: bool) -> std::io::Result<()> {
     match on {
         true => platform::write(&command()?),
@@ -27,12 +32,18 @@ pub fn set(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Points an entry at this Yapfast, after its folder moved or an update.
+/// Points an entry that's on at this Yapfast once the program it names is
+/// gone, as after its folder moved; an update in place keeps the name. One
+/// naming a program that's there stays, so a copy run from a disk image or
+/// another build doesn't take it over, to name nothing once ejected or
+/// deleted. It only writes the entry, and never asks the person anything.
 pub fn refresh() {
-    if enabled()
-        && let Err(error) = set(true)
-    {
-        tracing::warn!(%error, "could not update starting at sign-in");
+    if !enabled() || platform::program().is_some_and(|program| program.exists()) {
+        return;
+    }
+    match command().and_then(|command| platform::write(&command)) {
+        Ok(()) => tracing::info!("starting at sign-in now starts this Yapfast"),
+        Err(error) => tracing::warn!(%error, "could not update starting at sign-in"),
     }
 }
 
@@ -73,9 +84,114 @@ fn command() -> std::io::Result<Vec<String>> {
 }
 
 fn path_text(path: PathBuf) -> std::io::Result<String> {
-    path.into_os_string()
+    let text = path
+        .into_os_string()
         .into_string()
-        .map_err(|path| std::io::Error::other(format!("{} isn't valid Unicode", path.display())))
+        .map_err(|path| std::io::Error::other(format!("{} isn't valid Unicode", path.display())))?;
+    // Each entry holds its arguments on a line, or in XML, which a control
+    // character would break.
+    if text.contains(char::is_control) {
+        return Err(std::io::Error::other(format!(
+            "{text:?} holds a control character"
+        )));
+    }
+    Ok(text)
+}
+
+/// The program a Run value names: its first argument, quoted or not.
+#[cfg(any(windows, test))]
+fn windows_program(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let program = match line.strip_prefix('"') {
+        Some(rest) => &rest[..rest.find('"')?],
+        None => line.split([' ', '\t']).next()?,
+    };
+    (!program.is_empty()).then(|| program.to_owned())
+}
+
+/// One argument of a desktop entry's Exec line, quoted as the Desktop Entry
+/// specification asks when it holds anything but plain characters.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_argument(argument: &str) -> String {
+    let argument = argument.replace('%', "%%");
+    let plain = !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_alphanumeric() || "-_./=:+,@%".contains(character));
+    if plain {
+        return argument;
+    }
+    let mut quoted = String::from('"');
+    for character in argument.chars() {
+        if matches!(character, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The program an Exec line names, its first argument, as `desktop_argument`
+/// quotes it.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_program(exec: &str) -> Option<String> {
+    let exec = exec.trim_start();
+    let program = match exec.strip_prefix('"') {
+        Some(rest) => {
+            let mut program = String::new();
+            let mut characters = rest.chars();
+            loop {
+                match characters.next()? {
+                    '"' => break program,
+                    '\\' => program.push(characters.next()?),
+                    character => program.push(character),
+                }
+            }
+        }
+        None => exec.split(' ').next()?.to_owned(),
+    };
+    let program = program.replace("%%", "%");
+    (!program.is_empty()).then_some(program)
+}
+
+/// The program an agent runs, the first of its arguments, as `launch_agent`
+/// writes it.
+#[cfg(any(target_os = "macos", test))]
+fn agent_program(agent: &str) -> Option<String> {
+    let (_, arguments) = agent.split_once("<key>ProgramArguments</key>")?;
+    let (_, first) = arguments.split_once("<string>")?;
+    let (program, _) = first.split_once("</string>")?;
+    Some(
+        program
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Writes `text` to `path` whole or not at all, so launchd or a desktop
+/// reading it never sees half, and on disk before it takes the old one's
+/// place. A write cut short before, as by a crash, left its copy beside it,
+/// which goes first; the copies' names start with a dot, which launchd and
+/// desktops pass over.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let folder = path.parent().expect("the entry is in a folder");
+    std::fs::create_dir_all(folder)?;
+    let prefix = format!(".{}.", crate::icon::APP_ID);
+    for leftover in std::fs::read_dir(folder)?.flatten() {
+        if leftover.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(leftover.path());
+        }
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempfile_in(folder)?;
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path).map(drop).map_err(|error| error.error)
 }
 
 /// One argument of the command line, quoted when it holds a space, as
@@ -186,6 +302,16 @@ mod linux {
         }
     }
 
+    pub fn program() -> Option<PathBuf> {
+        entry_program(&config()?)
+    }
+
+    pub(super) fn entry_program(config: &Path) -> Option<PathBuf> {
+        let entry = std::fs::read_to_string(entry(config)).ok()?;
+        let exec = entry.lines().find_map(|line| line.strip_prefix("Exec="))?;
+        super::desktop_program(exec).map(PathBuf::from)
+    }
+
     /// `$XDG_CONFIG_HOME`, or `~/.config`.
     fn config() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
@@ -214,10 +340,10 @@ mod linux {
     }
 
     pub(super) fn write_entry(config: &Path, command: &[String]) -> std::io::Result<()> {
-        let path = entry(config);
-        let folder = path.parent().expect("the entry is in a folder");
-        std::fs::create_dir_all(folder)?;
-        let exec: Vec<String> = command.iter().map(|argument| quoted(argument)).collect();
+        let exec: Vec<String> = command
+            .iter()
+            .map(|argument| super::desktop_argument(argument))
+            .collect();
         let text = format!(
             "[Desktop Entry]\nType=Application\nName=Yapfast\n\
              Comment=Starts Yapfast in the system tray when you sign in\n\
@@ -225,32 +351,7 @@ mod linux {
             exec.join(" "),
             crate::icon::APP_ID,
         );
-        // Whole or not at all: a desktop reading it never sees half.
-        let file = tempfile::NamedTempFile::new_in(folder)?;
-        std::fs::write(file.path(), text)?;
-        file.persist(&path).map(drop).map_err(|error| error.error)
-    }
-
-    /// One argument of an entry's Exec line, quoted as the Desktop Entry
-    /// specification asks when it holds anything but plain characters.
-    fn quoted(argument: &str) -> String {
-        let argument = argument.replace('%', "%%");
-        let plain = !argument.is_empty()
-            && argument
-                .chars()
-                .all(|character| character.is_alphanumeric() || "-_./=:+,@%".contains(character));
-        if plain {
-            return argument;
-        }
-        let mut quoted = String::from('"');
-        for character in argument.chars() {
-            if matches!(character, '"' | '`' | '$' | '\\') {
-                quoted.push('\\');
-            }
-            quoted.push(character);
-        }
-        quoted.push('"');
-        quoted
+        super::write_whole(&entry(config), &text)
     }
 
     #[cfg(test)]
@@ -274,6 +375,10 @@ mod linux {
                 r#"Exec="/opt/Yapfast Builds/yapfast" --background --data-dir "/home/a/100%% \$data""#
             ));
             assert!(text.contains("Name=Yapfast\n"));
+            assert_eq!(
+                entry_program(config.path()),
+                Some(PathBuf::from("/opt/Yapfast Builds/yapfast"))
+            );
         }
 
         #[test]
@@ -339,6 +444,16 @@ mod windows {
     pub fn remove() -> io::Result<()> {
         delete(RUN)?;
         delete(APPROVED)
+    }
+
+    pub fn program() -> Option<std::path::PathBuf> {
+        let value = query(RUN, RRF_RT_REG_SZ)?;
+        let line: Vec<u16> = value
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        super::windows_program(&String::from_utf16_lossy(&line)).map(Into::into)
     }
 
     fn delete(key: &str) -> io::Result<()> {
@@ -455,11 +570,14 @@ mod windows {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{
+        cell::Cell,
         io,
         path::{Path, PathBuf},
+        time::Duration,
     };
 
-    use objc2::{msg_send, runtime::AnyClass};
+    use objc2::{MainThreadMarker, msg_send, rc::autoreleasepool, runtime::AnyClass};
+    use objc2_app_kit::NSApplication;
     use objc2_foundation::{NSString, NSURL};
 
     // ServiceManagement has been in macOS since 10.6. Only SMAppService, which
@@ -468,28 +586,48 @@ mod macos {
     #[link(name = "ServiceManagement", kind = "framework")]
     unsafe extern "C" {}
 
+    /// `SMAppServiceStatusEnabled`: the entry runs at sign-in.
+    const ENABLED: isize = 1;
     /// `SMAppServiceStatusRequiresApproval`: the person turned the entry off
     /// in System Settings.
     const REQUIRES_APPROVAL: isize = 2;
 
+    thread_local! {
+        /// Yapfast asked AppKit not to open it again as the person signs in.
+        static NOT_REOPENED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The entry is there, and System Settings doesn't have it off. Before
+    /// macOS has looked a new entry over, for about a second, it says it
+    /// isn't found, and it says it's enabled even of one whose program is
+    /// gone: only "requires approval" is off.
     pub fn enabled() -> bool {
         agents().is_some_and(|agents| {
             let path = entry(&agents);
-            path.exists() && allowed(&path)
+            path.exists() && status(&path) != Some(REQUIRES_APPROVAL)
         })
     }
 
     pub fn write(command: &[String]) -> io::Result<()> {
         let agents = agents().ok_or_else(|| io::Error::other("no home folder"))?;
-        write_entry(&agents, command)?;
-        // Only the person can turn it on again there, so show them where.
-        if !allowed(&entry(&agents)) {
-            open_login_items();
-            return Err(io::Error::other(
-                "Yapfast is turned off in System Settings, under Login Items",
-            ));
+        let path = entry(&agents);
+        if !write_entry(&agents, command)? {
+            return Ok(());
+        }
+        // Wait for macOS to look it over, so what `enabled` says after is its
+        // answer, which may be that the person turned Yapfast off before.
+        for _ in 0..20 {
+            if status(&path).is_none_or(|status| matches!(status, ENABLED | REQUIRES_APPROVAL)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
         Ok(())
+    }
+
+    pub fn program() -> Option<PathBuf> {
+        let agent = std::fs::read_to_string(entry(&agents()?)).ok()?;
+        super::agent_program(&agent).map(PathBuf::from)
     }
 
     pub fn remove() -> io::Result<()> {
@@ -512,42 +650,57 @@ mod macos {
         agents.join(format!("{}.plist", crate::icon::APP_ID))
     }
 
-    pub(super) fn write_entry(agents: &Path, command: &[String]) -> io::Result<()> {
+    /// Writes the entry, unless it's already right, so macOS doesn't look it
+    /// over again; whether it wrote.
+    pub(super) fn write_entry(agents: &Path, command: &[String]) -> io::Result<bool> {
         let path = entry(agents);
         let text = super::launch_agent(command);
-        // Each start leaves an entry that's already right alone, rather than
-        // have macOS look it over again.
         if std::fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
-            return Ok(());
+            return Ok(false);
         }
-        std::fs::create_dir_all(agents)?;
-        // Whole or not at all: launchd reading it never sees half.
-        let file = tempfile::NamedTempFile::new_in(agents)?;
-        std::fs::write(file.path(), text)?;
-        file.persist(&path).map(drop).map_err(|error| error.error)
+        super::write_whole(&path, &text)?;
+        Ok(true)
     }
 
-    /// Whether System Settings lets the entry run. From macOS 13 its Login
-    /// Items list it under Allow in the Background, with a switch; before,
-    /// an entry that's there runs.
-    fn allowed(path: &Path) -> bool {
-        let Some(service) = AnyClass::get(c"SMAppService") else {
-            return true;
-        };
-        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        // SAFETY: the class method takes a file URL and returns an
-        // SMAppServiceStatus, an NSInteger.
-        let status: isize = unsafe { msg_send![service, statusForLegacyURL: &*url] };
-        // A new entry reads as not found for a moment, until macOS has
-        // looked it over, then as enabled.
-        status != REQUIRES_APPROVAL
+    /// What System Settings → General → Login Items says of the entry, from
+    /// macOS 13, which lists it under Allow in the Background with a switch.
+    /// `None` before, where the file alone is the setting.
+    fn status(path: &Path) -> Option<isize> {
+        let service = AnyClass::get(c"SMAppService")?;
+        // Off the UI thread, where nothing else drains what it autoreleases.
+        autoreleasepool(|_| {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            // SAFETY: the class method takes a file URL and returns an
+            // SMAppServiceStatus, an NSInteger.
+            Some(unsafe { msg_send![service, statusForLegacyURL: &*url] })
+        })
     }
 
-    /// Opens System Settings at Login Items, from macOS 13.
-    fn open_login_items() {
+    /// Opens System Settings at Login Items, from macOS 13: once the person
+    /// turned Yapfast off there, only they can turn it on again.
+    pub fn open_login_items() {
         if let Some(service) = AnyClass::get(c"SMAppService") {
             // SAFETY: a class method without arguments that returns nothing.
             let () = unsafe { msg_send![service, openSystemSettingsLoginItems] };
+        }
+    }
+
+    /// Whether macOS may open Yapfast again as the person signs back in,
+    /// which "Reopen windows when logging back in" does for apps left
+    /// running. While the entry is on, it starts Yapfast already, and two
+    /// would run, one with its window. AppKit counts these calls, so each
+    /// way goes once.
+    pub fn reopen_at_sign_in(reopen: bool) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        if NOT_REOPENED.replace(!reopen) == !reopen {
+            return;
+        }
+        let app = NSApplication::sharedApplication(mtm);
+        match reopen {
+            true => app.enableRelaunchOnLogin(),
+            false => app.disableRelaunchOnLogin(),
         }
     }
 
@@ -577,12 +730,18 @@ mod macos {
                 "--data-dir".to_owned(),
                 "/Users/a/<data>".to_owned(),
             ];
-            write_entry(agents.path(), &command).unwrap();
+            assert!(write_entry(agents.path(), &command).unwrap());
             let agent = read(agents.path());
             assert_eq!(agent["Label"], json!(crate::icon::APP_ID));
             assert_eq!(agent["ProgramArguments"], json!(command));
             assert_eq!(agent["RunAtLoad"], json!(true));
             assert_eq!(agent["LimitLoadToSessionType"], json!("Aqua"));
+            let text = std::fs::read_to_string(entry(agents.path())).unwrap();
+            assert_eq!(
+                super::super::agent_program(&text).as_ref(),
+                Some(&command[0])
+            );
+            assert!(!write_entry(agents.path(), &command).unwrap(), "it's right");
         }
 
         /// Writes the person's own LaunchAgents, which System Settings shows,
@@ -592,16 +751,23 @@ mod macos {
         fn turns_on_and_off_as_system_settings_sees_it() {
             remove().unwrap();
             assert!(!enabled());
-            write(&["/Applications/Yapfast.app/Contents/MacOS/yapfast".into()]).unwrap();
-            assert!(enabled());
-            // Each start points it at the Yapfast that's running.
+            let gone = "/Applications/Gone/Yapfast.app/Contents/MacOS/yapfast";
+            write(&[gone.into(), "--background".into()]).unwrap();
+            assert!(enabled(), "macOS has it on, though its program is gone");
+            // A start points an entry whose program is gone at this Yapfast.
             super::super::refresh();
             let program = std::env::current_exe().unwrap();
+            let program = program.to_string_lossy();
             let agents = agents().unwrap();
             assert_eq!(
                 read(&agents)["ProgramArguments"],
-                json!([program.to_string_lossy(), "--background"])
+                json!([program, "--background"])
             );
+            // One whose program is there stays, as for another copy's.
+            let other = [&*program, "--background", "--data-dir", "/elsewhere"];
+            write(&other.map(String::from)).unwrap();
+            super::super::refresh();
+            assert_eq!(read(&agents)["ProgramArguments"], json!(other));
             assert!(enabled());
             remove().unwrap();
             assert!(!enabled());
@@ -625,11 +791,67 @@ mod none {
     pub fn remove() -> std::io::Result<()> {
         Ok(())
     }
+
+    pub fn program() -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{launch_agent, windows_argument};
+    use super::*;
+
+    #[test]
+    fn reads_back_the_program_each_entry_names() {
+        let command = [
+            "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast".to_owned(),
+            "--background".to_owned(),
+        ];
+        assert_eq!(
+            agent_program(&launch_agent(&command)).as_ref(),
+            Some(&command[0])
+        );
+        for program in ["/opt/Yapfast Builds/100% \"yap\" $fast", "/usr/bin/yapfast"] {
+            let exec = format!("{} --background", desktop_argument(program));
+            assert_eq!(desktop_program(&exec).as_deref(), Some(program), "{exec}");
+        }
+        let line = format!(
+            "{} --background",
+            windows_argument(r"C:\Program Files\Yapfast\yapfast.exe")
+        );
+        assert_eq!(
+            windows_program(&line).as_deref(),
+            Some(r"C:\Program Files\Yapfast\yapfast.exe")
+        );
+        assert_eq!(
+            windows_program(r"C:\Yapfast\yapfast.exe --background").as_deref(),
+            Some(r"C:\Yapfast\yapfast.exe")
+        );
+        assert_eq!(windows_program(""), None);
+        assert_eq!(desktop_program(r#""unclosed"#), None);
+    }
+
+    #[test]
+    fn refuses_a_path_an_entry_couldnt_hold() {
+        assert!(path_text(PathBuf::from("/Applications/Yap\nfast.app")).is_err());
+        assert!(path_text(PathBuf::from("/Applications/Yapfast.app")).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn writes_entries_whole_and_clears_what_a_cut_write_left() {
+        let folder = tempfile::tempdir().unwrap();
+        let leftover = folder.path().join(".io.github.yapfast.Yapfast.cut");
+        std::fs::write(&leftover, "half").unwrap();
+        let path = folder.path().join("entry");
+        write_whole(&path, "whole").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "whole");
+        let names: Vec<_> = std::fs::read_dir(folder.path())
+            .unwrap()
+            .map(|file| file.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["entry"]);
+    }
 
     #[test]
     fn writes_a_launch_agent_that_starts_in_the_tray() {

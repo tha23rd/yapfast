@@ -154,9 +154,9 @@ pub fn run(
     }
     if !preview {
         AUTOSTART.set(autostart::SUPPORTED);
-        autostart::refresh();
     }
     prepare(&window);
+    sign_in_entry(&window, SignIn::Refresh);
     let adapter = Adapter::new(Arc::new(runtime), root, &window)?;
     bind_callbacks(&window, &adapter);
     watch_window(&window, &adapter);
@@ -237,11 +237,75 @@ fn starts_hidden(background: bool, preview: bool, can_restore: impl FnOnce() -> 
     background && (preview || can_restore())
 }
 
+/// What `sign_in_entry` does with the entry that starts Yapfast at sign-in,
+/// before Settings shows it.
+#[derive(Clone, Copy, Debug)]
+enum SignIn {
+    /// Reads it: Settings opened, or came to the front again, and the person
+    /// may have changed it in Task Manager or System Settings meanwhile.
+    Read,
+    /// Points it at this Yapfast if the program it names is gone, at start.
+    Refresh,
+    /// Turns it on or off, as the person flipped the switch.
+    Turn(bool),
+}
+
+/// Does `what` with the entry, then shows whether Yapfast starts at sign-in.
+/// On macOS a read asks Background Task Management, and turning it on waits
+/// for its answer, so the work goes to a thread of its own, one piece at a
+/// time, and only the answer comes back to the UI thread.
+fn sign_in_entry(window: &YapfastWindow, what: SignIn) {
+    if !AUTOSTART.get() {
+        return;
+    }
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let weak = window.as_weak();
+    let work = move || {
+        let _turn = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let turned = match what {
+            SignIn::Read => None,
+            SignIn::Refresh => {
+                autostart::refresh();
+                None
+            }
+            SignIn::Turn(on) => Some(autostart::set(on).map(|()| on)),
+        };
+        let on = autostart::enabled();
+        let _ = slint::invoke_from_event_loop(move || {
+            match turned {
+                // Off in System Settings, where only the person can turn it on.
+                Some(Ok(true)) if !on => {
+                    tracing::info!("starting at sign-in is off in System Settings");
+                    #[cfg(target_os = "macos")]
+                    autostart::open_login_items();
+                }
+                Some(Ok(start)) => tracing::info!(start, "starting at sign-in changed"),
+                Some(Err(error)) => tracing::warn!(%error, "could not change starting at sign-in"),
+                None => {}
+            }
+            STARTS_AT_SIGN_IN.set(on);
+            #[cfg(target_os = "macos")]
+            autostart::reopen_at_sign_in(!on);
+            if let Some(window) = weak.upgrade() {
+                window.set_start_on_sign_in(on);
+            }
+        });
+    };
+    let spawned = std::thread::Builder::new()
+        .name("yapfast-autostart".into())
+        .spawn(work);
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not read starting at sign-in");
+    }
+}
+
 fn prepare(window: &YapfastWindow) {
-    // The entry is the setting, so each window reads it as it is.
+    // As last read; Settings reads it again as they open.
     let autostart = AUTOSTART.get();
     window.set_autostart_available(autostart);
-    window.set_start_on_sign_in(autostart && autostart::enabled());
+    window.set_start_on_sign_in(autostart && STARTS_AT_SIGN_IN.get());
     // Without Matrix everything is Discord's, so its badge would say nothing.
     window
         .global::<Badges>()
@@ -373,6 +437,10 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                         show_motion(&window);
                         if *focused {
                             attention(&window, false);
+                        }
+                        // Back from Task Manager or System Settings, perhaps.
+                        if *focused && window.get_settings_open() {
+                            sign_in_entry(&window, SignIn::Read);
                         }
                     }
                 }
@@ -534,6 +602,8 @@ thread_local! {
     static FOCUSED: Cell<bool> = const { Cell::new(false) };
     /// Settings offer starting at sign-in: the platform can, and this isn't the preview.
     static AUTOSTART: Cell<bool> = const { Cell::new(false) };
+    /// Whether Yapfast starts at sign-in, as last read; see `sign_in_entry`.
+    static STARTS_AT_SIGN_IN: Cell<bool> = const { Cell::new(false) };
     /// When animations play, as the settings say.
     static ANIMATE: Cell<Animate> = const { Cell::new(Animate::Focused) };
     /// Opens a conversation from a clicked notification, in the current window.

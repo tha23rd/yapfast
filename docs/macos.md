@@ -344,7 +344,7 @@ took 156 MB and 72 MB.
 ## Checks
 
 On the MacBook Air, with the `fast` profile, the whole workspace's tests pass
-for the Discord flavour (103 in the app, 243 in `yapfast-core`, 164 in
+for the Discord flavour (108 in the app, 243 in `yapfast-core`, 164 in
 `yapfast-discord`), as does Clippy with warnings denied for it and for the
 full flavour. `scripts/test-fake-discord`, run with `IN_NIX_SHELL=1` and Bun
 from mise, passes its Discord service and `discord_text` tests; its example
