@@ -3,19 +3,20 @@
 //! own as it plays or records them.
 //!
 //! Speakers queue in the queue's own buffers. Writing fills a free buffer and
-//! gives it to the queue, and waits while the queue has them all. The queue
-//! starts once it has them all, or once draining, and pauses when it hands
-//! the last back: a late write doesn't break up into gaps, as with
-//! PulseAudio's prebuffering, and an idle stream lets the device rest.
+//! gives it to the queue, and waits while the queue has them all. After the
+//! queue runs dry, and before it first plays, filled buffers wait until all
+//! are, then go together, so a late write doesn't break up into gaps, as with
+//! PulseAudio's prebuffering; the queue keeps running meanwhile, so playing
+//! again costs no restart. Draining pauses it, so the device may rest.
 //! Microphones' buffers go back to the queue as soon as they're recorded,
 //! their samples into a ring that reading takes from.
 //!
 //! Each stream names its device to its queue, so one on the default device
 //! follows the default by hand, as PulseAudio moves its streams: writing and
 //! reading look at the default now and then, and when it's another device,
-//! the stream opens a new queue there. A stream whose queue stops handing
-//! buffers back, as when its device goes away, opens a new one too, on its
-//! device if it's still there and on the default if not.
+//! the stream makes a queue there, and swaps it in once it's made. A stream
+//! whose device is gone, or whose queue stops handing buffers back, makes a
+//! new one too, on its device if it's still there and on the default if not.
 //!
 //! LiveKit's macOS device module names each device by its Core Audio object
 //! id, and the default one "default".
@@ -29,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use objc2_audio_toolbox::{
     AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose, AudioQueueEnqueueBuffer,
     AudioQueueNewInput, AudioQueueNewOutput, AudioQueuePause, AudioQueueRef, AudioQueueSetProperty,
@@ -38,14 +39,15 @@ use objc2_audio_toolbox::{
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectPropertySelector,
-    kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyLatency, kAudioDevicePropertyNominalSampleRate,
-    kAudioDevicePropertySafetyOffset, kAudioDevicePropertyStreamConfiguration,
-    kAudioDevicePropertyStreams, kAudioHardwarePropertyDefaultInputDevice,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioStreamPropertyLatency,
+    kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceIsAlive,
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyLatency,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
+    kAudioDevicePropertyStreamConfiguration, kAudioDevicePropertyStreams,
+    kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioStreamPropertyLatency,
 };
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioStreamPacketDescription,
@@ -72,12 +74,18 @@ const RECORDING_AHEAD: Duration = Duration::from_millis(100);
 /// A running queue hands a buffer back every few milliseconds; this long
 /// without one, its device stopped.
 const SILENCE: Duration = Duration::from_secs(2);
-/// The first buffer after a queue starts may take longer: a Bluetooth device
-/// wakes, or macOS asks the person whether Yapfast may use the microphone.
-const STARTING: Duration = Duration::from_secs(30);
-/// How often a stream on the default device looks whether the default
+/// The first buffer after speakers start may take longer, as a Bluetooth
+/// device wakes or changes profile.
+const SPEAKERS_STARTING: Duration = Duration::from_secs(5);
+/// A microphone's first buffer may take longer still: the first time, macOS
+/// asks the person whether Yapfast may use it.
+const MICROPHONE_STARTING: Duration = Duration::from_secs(30);
+/// How often a stream looks whether its device is gone or the default
 /// changed, and how long it waits between looks.
 const LOOK: Duration = Duration::from_millis(250);
+/// After a new queue couldn't be made, how long the stream keeps the one it
+/// has before trying again.
+const RETRY: Duration = Duration::from_secs(1);
 
 /// One of a queue's buffers.
 struct Buffer(AudioQueueBufferRef);
@@ -95,22 +103,35 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
+    /// The queue in use. A queue being disposed of may still call back, and
+    /// is ignored.
+    queue: usize,
     /// Buffers the queue handed back, to tell a stalled device.
     returned: u64,
     /// A buffer couldn't go back to the queue: it needs a new one.
     failed: bool,
-    /// Speakers' buffers the queue doesn't have; writing fills the last.
+    /// Speakers' buffers that are empty; writing fills the last.
     free: VecDeque<Buffer>,
     /// The bytes written into the last free buffer.
     filled: usize,
+    /// Speakers' buffers filled while waiting to fill them all.
+    ready: Vec<Buffer>,
+    waiting: bool,
     /// The bytes in the buffers the queue has.
     queued: usize,
+    /// The queue was started and isn't paused.
     running: bool,
     draining: bool,
     /// What the microphone recorded and reading hasn't taken.
     ring: VecDeque<u8>,
     /// The most the ring holds, in bytes.
     capacity: usize,
+}
+
+impl State {
+    fn current(&self, queue: AudioQueueRef) -> bool {
+        self.queue == queue as usize
+    }
 }
 
 impl Shared {
@@ -192,8 +213,10 @@ struct Stream {
     count: usize,
     /// How long the device takes to play or record, beyond the queue.
     latency: Duration,
-    /// When the default was last looked at.
+    /// When the device was last looked at, and when a queue that couldn't be
+    /// made may be tried again.
     looked: Instant,
+    retry: Option<Instant>,
     /// When the queue last started or handed a buffer back, with the count
     /// of buffers back then, and whether one came back since it started.
     progress: Instant,
@@ -225,6 +248,7 @@ impl Stream {
             count,
             latency: Duration::ZERO,
             looked: Instant::now(),
+            retry: None,
             progress: Instant::now(),
             seen: 0,
             fresh: true,
@@ -242,28 +266,19 @@ impl Stream {
         self.queue.as_ref().map_or(null_mut(), |queue| queue.0)
     }
 
-    /// A queue on `device` in place of the one before, whose buffers and
+    /// A queue on `device`, with its buffers, made before the one in use
+    /// goes, so a device that won't take one leaves the stream as it was.
+    /// Swapped in, it takes the place of the one before, whose buffers and
     /// what they held go with it. A microphone's starts recording; speakers'
     /// buffers wait to be written.
     fn make(&mut self, device: AudioObjectID) -> Result<()> {
-        self.shared.lock().running = false;
-        // Disposing waits for the callback, which takes the lock.
-        self.queue = None;
-        {
-            let mut state = self.shared.lock();
-            state.free.clear();
-            state.filled = 0;
-            state.queued = 0;
-            state.draining = false;
-            state.failed = false;
-        }
         let uid = string(device, kAudioDevicePropertyDeviceUID).context("device not found")?;
-        let mut queue: AudioQueueRef = null_mut();
+        let mut made: AudioQueueRef = null_mut();
         let shared = Arc::as_ptr(&self.shared).cast_mut().cast();
         let description = description(self.format);
         // SAFETY: `shared` outlives the queue, which `Stream` disposes of
         // first.
-        let made = unsafe {
+        let status = unsafe {
             if self.input() {
                 AudioQueueNewInput(
                     NonNull::from(&description),
@@ -272,7 +287,7 @@ impl Stream {
                     None,
                     None,
                     0,
-                    NonNull::from(&mut queue),
+                    NonNull::from(&mut made),
                 )
             } else {
                 AudioQueueNewOutput(
@@ -282,12 +297,12 @@ impl Stream {
                     None,
                     None,
                     0,
-                    NonNull::from(&mut queue),
+                    NonNull::from(&mut made),
                 )
             }
         };
-        check(made, "the device refused the stream's format")?;
-        let queue = Queue(queue);
+        check(status, "the device refused the stream's format")?;
+        let queue = Queue(made);
         let uid: *const CFString = &*uid;
         // SAFETY: the property takes a CFStringRef, which the queue retains.
         check(
@@ -313,27 +328,46 @@ impl Stream {
             )?;
             buffers.push(Buffer(buffer));
         }
+        {
+            let mut state = self.shared.lock();
+            state.queue = made as usize;
+            state.free.clear();
+            state.ready.clear();
+            state.filled = 0;
+            state.queued = 0;
+            state.running = false;
+            state.draining = false;
+            state.failed = false;
+            if self.input() {
+                state.ring.clear();
+            } else {
+                state.free.extend(buffers.drain(..));
+                state.waiting = true;
+            }
+        }
+        // Disposing of the old queue waits for its callback, which takes the
+        // lock, and is ignored from here on.
         self.queue = Some(queue);
         self.device = device;
         self.latency = device_latency(device, self.scope);
+        self.retry = None;
+        for Buffer(buffer) in buffers {
+            // SAFETY: a microphone's buffer of this queue's.
+            check(
+                unsafe { AudioQueueEnqueueBuffer(made, buffer, 0, null()) },
+                "the microphone refused a buffer",
+            )?;
+        }
         if self.input() {
-            for Buffer(buffer) in buffers {
-                // SAFETY: a buffer of this queue's.
-                check(
-                    unsafe { AudioQueueEnqueueBuffer(self.queue(), buffer, 0, null()) },
-                    "the microphone refused a buffer",
-                )?;
-            }
+            self.shared.lock().running = true;
             self.start()?;
-        } else {
-            self.shared.lock().free.extend(buffers);
         }
         Ok(())
     }
 
-    /// Starts the queue, which runs until paused.
+    /// Starts the queue, which runs until paused. `running` is already set.
     fn start(&mut self) -> Result<()> {
-        // SAFETY: a queue with buffers in.
+        // SAFETY: a queue of this stream's.
         check(
             unsafe { AudioQueueStart(self.queue(), null()) },
             "the device wouldn't start",
@@ -357,22 +391,36 @@ impl Stream {
             Err(_) => find(None, self.scope)?,
         };
         tracing::info!(why, follows, input = self.input(), "sound opened again");
+        self.make(device)?;
         self.follows = follows;
-        self.make(device)
+        Ok(())
     }
 
-    /// Follows the default device, and replaces a queue that failed.
-    fn look(&mut self) -> Result<()> {
-        if self.shared.lock().failed {
-            return self.reopen("a buffer was refused");
+    /// Follows the default device, and replaces a queue whose device is gone
+    /// or that refused a buffer. A new queue that can't be made yet leaves
+    /// the old one in use, to try again in a moment.
+    fn look(&mut self) {
+        if self.retry.is_some_and(|retry| Instant::now() < retry)
+            || self.looked.elapsed() < LOOK && !self.shared.lock().failed
+        {
+            return;
         }
-        if self.follows && self.looked.elapsed() >= LOOK {
-            self.looked = Instant::now();
-            if find(None, self.scope).is_ok_and(|(device, _)| device != self.device) {
-                return self.reopen("the default device changed");
-            }
+        self.looked = Instant::now();
+        let why = if self.shared.lock().failed {
+            "a buffer was refused"
+        } else if !alive(self.device) {
+            "the device went away"
+        } else if self.follows
+            && find(None, self.scope).is_ok_and(|(device, _)| device != self.device)
+        {
+            "the default device changed"
+        } else {
+            return;
+        };
+        if let Err(error) = self.reopen(why) {
+            tracing::warn!(error = format!("{error:#}"), why, "sound couldn't move yet");
+            self.retry = Some(Instant::now() + RETRY);
         }
-        Ok(())
     }
 
     /// Waits a little for the queue to hand a buffer back. A queue that
@@ -393,19 +441,26 @@ impl Stream {
             self.retried = false;
             return Ok(());
         }
-        let patience = if self.fresh { STARTING } else { SILENCE };
-        if self.progress.elapsed() < patience {
+        if self.progress.elapsed() < self.patience() {
             return Ok(());
         }
         ensure!(!self.retried, stopped);
         self.retried = true;
         self.reopen("the device stopped")
     }
+
+    /// How long the queue may go without handing a buffer back.
+    fn patience(&self) -> Duration {
+        match (self.fresh, self.input()) {
+            (false, _) => SILENCE,
+            (true, false) => SPEAKERS_STARTING,
+            (true, true) => MICROPHONE_STARTING,
+        }
+    }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        self.shared.lock().running = false;
         self.queue = None;
     }
 }
@@ -437,10 +492,10 @@ impl Output {
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         let frame = self.stream.format.frame_bytes();
+        let shared = self.stream.shared.clone();
         let mut rest = bytes;
         while rest.len() >= frame {
-            self.stream.look()?;
-            let shared = self.stream.shared.clone();
+            self.stream.look();
             let mut state = shared.lock();
             let Some(&Buffer(buffer)) = state.free.back() else {
                 self.stream.wait(state, "the speakers stopped playing")?;
@@ -461,67 +516,107 @@ impl Output {
             data[filled..filled + count].copy_from_slice(&rest[..count]);
             rest = &rest[count..];
             state.filled += count;
-            if data.len() - state.filled < frame {
-                enqueue(self.stream.queue(), &mut state);
-                // The queue has them all: it plays.
-                if state.free.is_empty() && !state.running {
-                    state.running = true;
-                    drop(state);
-                    self.stream.start()?;
+            if data.len() - state.filled >= frame {
+                continue;
+            }
+            let full = take_filled(&mut state);
+            let given = if state.waiting {
+                // Until they're all full, or what's written drains.
+                state.ready.extend(full);
+                if !state.free.is_empty() {
+                    continue;
+                }
+                state.waiting = false;
+                std::mem::take(&mut state.ready)
+            } else {
+                full.into_iter().collect()
+            };
+            drop(state);
+            self.give(given)?;
+        }
+        Ok(())
+    }
+
+    /// Gives the queue filled buffers, starting it if it isn't running.
+    fn give(&mut self, buffers: Vec<Buffer>) -> Result<()> {
+        let queue = self.stream.queue();
+        let start = {
+            let mut state = self.stream.shared.lock();
+            for Buffer(buffer) in &buffers {
+                // SAFETY: a buffer of this queue's, which it doesn't have yet.
+                state.queued += unsafe { (**buffer).mAudioDataByteSize } as usize;
+            }
+            !std::mem::replace(&mut state.running, true)
+        };
+        // Outside the lock, which the queue's callback takes: an enqueue
+        // that waited for the callback would wait for this.
+        for Buffer(buffer) in buffers {
+            // SAFETY: a filled buffer of this queue's.
+            if unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, null()) } != 0 {
+                let mut state = self.stream.shared.lock();
+                if state.current(queue) {
+                    // SAFETY: as above; the queue refused it.
+                    let size = unsafe { (*buffer).mAudioDataByteSize } as usize;
+                    state.queued -= size;
+                    state.free.push_front(Buffer(buffer));
+                    state.failed = true;
                 }
             }
+        }
+        if start {
+            self.stream.start()?;
         }
         Ok(())
     }
 
     pub fn drain(&mut self) -> Result<()> {
         let shared = self.stream.shared.clone();
-        let deadline = {
+        let (given, started) = {
             let mut state = shared.lock();
-            if state.filled > 0 {
-                enqueue(self.stream.queue(), &mut state);
-            }
-            if state.queued == 0 {
+            let mut given = std::mem::take(&mut state.ready);
+            given.extend(take_filled(&mut state));
+            state.waiting = false;
+            if given.is_empty() && state.queued == 0 {
                 return Ok(());
             }
             state.draining = true;
+            (given, !state.running)
+        };
+        let drained = self.give(given).and_then(|()| {
+            // A queue just started may take a moment to start playing.
+            let starting = if started || self.stream.fresh {
+                SPEAKERS_STARTING
+            } else {
+                Duration::ZERO
+            };
             let deadline = Instant::now()
-                + self.duration(state.queued)
+                + self.duration(shared.lock().queued)
                 + self.stream.latency
+                + starting
                 + Duration::from_secs(1);
-            if !state.running {
-                state.running = true;
-                drop(state);
-                self.stream.start()?;
+            loop {
+                self.stream.look();
+                let state = shared.lock();
+                if state.queued == 0 {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("the speakers stopped playing"));
+                }
+                self.stream.wait(state, "the speakers stopped playing")?;
             }
-            deadline
-        };
-        let drained = loop {
-            if let Err(error) = self.stream.look() {
-                break Err(error);
-            }
-            let state = shared.lock();
-            if state.queued == 0 {
-                break Ok(());
-            }
-            if Instant::now() >= deadline {
-                break Err(anyhow::anyhow!("the speakers stopped playing"));
-            }
-            if let Err(error) = self.stream.wait(state, "the speakers stopped playing") {
-                break Err(error);
-            }
-        };
+        });
+        // The device plays what it took last before the queue pauses.
+        if drained.is_ok() {
+            std::thread::sleep(self.stream.latency.min(Duration::from_millis(500)));
+        }
         let mut state = shared.lock();
         state.draining = false;
-        if state.running && state.queued == 0 {
+        state.waiting = true;
+        if state.running && state.queued == 0 && state.current(self.stream.queue()) {
             state.running = false;
             // SAFETY: the queue has no buffers, so its callback won't run.
             unsafe { AudioQueuePause(self.stream.queue()) };
-        }
-        drop(state);
-        // The device plays what it took last.
-        if drained.is_ok() {
-            std::thread::sleep(self.stream.latency.min(Duration::from_millis(500)));
         }
         drained
     }
@@ -530,16 +625,21 @@ impl Output {
     pub fn flush(&mut self) {
         let unplayed = {
             let state = self.stream.shared.lock();
-            state.queued + state.filled > 0
+            state.queued + state.filled > 0 || !state.ready.is_empty()
         };
         if unplayed && let Err(error) = self.stream.make(self.stream.device) {
             tracing::warn!(error = format!("{error:#}"), "could not drop queued sound");
+            let mut state = self.stream.shared.lock();
+            state.filled = 0;
+            let ready = std::mem::take(&mut state.ready);
+            state.free.extend(ready);
         }
     }
 
     pub fn latency(&self) -> Duration {
         let state = self.stream.shared.lock();
-        self.duration(state.queued + state.filled) + self.stream.latency
+        let ready = state.ready.len() * self.stream.size;
+        self.duration(state.queued + ready + state.filled) + self.stream.latency
     }
 
     fn duration(&self, bytes: usize) -> Duration {
@@ -550,46 +650,38 @@ impl Output {
     }
 }
 
-/// Gives the queue the last free buffer, with what was written into it.
-fn enqueue(queue: AudioQueueRef, state: &mut State) {
-    let Some(Buffer(buffer)) = state.free.pop_back() else {
-        return;
-    };
+/// Takes the last free buffer, with what was written into it, if anything was.
+fn take_filled(state: &mut State) -> Option<Buffer> {
     let size = std::mem::take(&mut state.filled);
-    // SAFETY: a buffer of this queue's, which it doesn't have, holding
-    // `size` bytes of samples.
-    let given = unsafe {
-        (*buffer).mAudioDataByteSize = size as u32;
-        AudioQueueEnqueueBuffer(queue, buffer, 0, null())
-    };
-    if given == 0 {
-        state.queued += size;
-    } else {
-        state.free.push_back(Buffer(buffer));
-        state.failed = true;
+    if size == 0 {
+        return None;
     }
+    let buffer = state.free.pop_back()?;
+    // SAFETY: a buffer the queue doesn't have, holding `size` bytes.
+    unsafe { (*buffer.0).mAudioDataByteSize = size as u32 };
+    Some(buffer)
 }
 
-/// Takes back a buffer the speakers' queue played. When it was the last, the
-/// queue pauses until it has them all again.
+/// Takes back a buffer the speakers' queue played. When it was the last,
+/// filled buffers wait until they all are; the queue runs on, starved.
 unsafe extern "C-unwind" fn play(
     shared: *mut c_void,
     queue: AudioQueueRef,
     buffer: AudioQueueBufferRef,
 ) {
-    // SAFETY: the stream's `Shared`, which outlives its queue, and a buffer
-    // of that queue's, which it gives back.
+    // SAFETY: the stream's `Shared`, which outlives its queues, and a buffer
+    // of this queue's, which it gives back.
     let (shared, played) = unsafe { (&*shared.cast::<Shared>(), (*buffer).mAudioDataByteSize) };
     let mut state = shared.lock();
+    if !state.current(queue) {
+        return;
+    }
     state.returned += 1;
     state.queued = state.queued.saturating_sub(played as usize);
     // The buffer being written stays last.
     state.free.push_front(Buffer(buffer));
-    if state.queued == 0 && state.running && !state.draining {
-        state.running = false;
-        // SAFETY: the queue has no buffers left, so no callback is waiting
-        // for the lock this holds.
-        unsafe { AudioQueuePause(queue) };
+    if state.queued == 0 && !state.draining {
+        state.waiting = true;
     }
     drop(state);
     shared.changed.notify_all();
@@ -622,13 +714,13 @@ impl Input {
     }
 
     pub fn read(&mut self, bytes: &mut [u8]) -> Result<()> {
+        let shared = self.stream.shared.clone();
         ensure!(
-            bytes.len() <= self.stream.shared.lock().capacity,
+            bytes.len() <= shared.lock().capacity,
             "reading more than the microphone keeps"
         );
         loop {
-            self.stream.look()?;
-            let shared = self.stream.shared.clone();
+            self.stream.look();
             let mut state = shared.lock();
             if state.ring.len() >= bytes.len() {
                 let (front, back) = state.ring.as_slices();
@@ -655,24 +747,28 @@ unsafe extern "C-unwind" fn record(
     _: u32,
     _: *const AudioStreamPacketDescription,
 ) {
-    // SAFETY: the stream's `Shared`, which outlives its queue, and a buffer
-    // of that queue's holding what it recorded, which goes back after.
+    // SAFETY: the stream's `Shared`, which outlives its queues, and a buffer
+    // of this queue's holding what it recorded, which goes back after.
     let shared = unsafe { &*shared.cast::<Shared>() };
+    let mut state = shared.lock();
+    if !state.current(queue) {
+        return;
+    }
+    // SAFETY: as above.
     let recorded = unsafe {
         std::slice::from_raw_parts(
             (*buffer).mAudioData.as_ptr().cast::<u8>(),
             (*buffer).mAudioDataByteSize as usize,
         )
     };
-    let mut state = shared.lock();
     state.returned += 1;
     let over = (state.ring.len() + recorded.len())
         .saturating_sub(state.capacity)
         .min(state.ring.len());
     state.ring.drain(..over);
     state.ring.extend(recorded);
-    // SAFETY: a buffer of this queue's. While the queue is being disposed
-    // of, it's refused, and nothing reads `failed` after.
+    // SAFETY: a buffer of this queue's. Reading never calls the queue while
+    // holding the lock, so enqueueing under it waits on nothing of ours.
     if unsafe { AudioQueueEnqueueBuffer(queue, buffer, 0, null()) } != 0 {
         state.failed = true;
     }
@@ -723,6 +819,18 @@ fn find(id: Option<&str>, scope: AudioObjectPropertyScope) -> Result<(AudioObjec
         }
     }
     bail!("device not found")
+}
+
+/// Whether a device is still there to play or record.
+fn alive(device: AudioObjectID) -> bool {
+    number::<u32>(
+        device,
+        address(
+            kAudioDevicePropertyDeviceIsAlive,
+            kAudioObjectPropertyScopeGlobal,
+        ),
+    )
+    .is_some_and(|alive| alive != 0)
 }
 
 fn address(

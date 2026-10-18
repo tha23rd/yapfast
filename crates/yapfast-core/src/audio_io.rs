@@ -392,6 +392,43 @@ mod tests {
         );
     }
 
+    /// Speakers that ran dry play again as soon as their queue fills, so a
+    /// second written in time, as a call writes, takes a second, and no
+    /// write waits long.
+    #[test]
+    #[ignore = "needs sound devices"]
+    fn plays_again_after_running_dry() {
+        let mut output = Output::<i16>::open(
+            None,
+            "Test silence",
+            RATE,
+            2,
+            Some(Duration::from_millis(60)),
+        )
+        .unwrap();
+        let frame = [0i16; RATE as usize / 50 * 2];
+        for _ in 0..5 {
+            output.write(&frame).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let mut slowest = Duration::ZERO;
+        for written in 1..=50 {
+            let writing = std::time::Instant::now();
+            output.write(&frame).unwrap();
+            slowest = slowest.max(writing.elapsed());
+            let due = started + Duration::from_millis(20 * written);
+            std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+        }
+        let took = started.elapsed();
+        eprintln!("a second written in time took {took:?}, the slowest write {slowest:?}");
+        assert!((950..1150).contains(&took.as_millis()), "took {took:?}");
+        assert!(
+            slowest < Duration::from_millis(80),
+            "a write waited {slowest:?}"
+        );
+    }
+
     fn tone(at: usize) -> f32 {
         0.25 * (at as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin()
     }
