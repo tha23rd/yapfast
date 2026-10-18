@@ -440,7 +440,7 @@ struct Video {
 /// dropped there.
 enum SharedSound {
     Starting(channel::Receiver<Result<stream_audio::Capture>>),
-    On { _capture: stream_audio::Capture },
+    On { capture: stream_audio::Capture },
     Off,
 }
 
@@ -461,13 +461,26 @@ impl SharedSound {
         }
     }
 
+    /// Stops the capture on a thread of its own, as when the stream moves to
+    /// another server: stopping waits for its threads, which mustn't hold up
+    /// the video.
+    fn stop_aside(self) {
+        if let Self::On { capture } = self
+            && let Err(error) = std::thread::Builder::new()
+                .name("yapfast-stream-sound-stop".into())
+                .spawn(move || drop(capture))
+        {
+            tracing::warn!(%error, "stopped the stream's sound in the way");
+        }
+    }
+
     /// Takes the capture once it has started.
     fn poll(&mut self) {
         let Self::Starting(starting) = self else {
             return;
         };
         *self = match starting.try_recv() {
-            Ok(Ok(capture)) => Self::On { _capture: capture },
+            Ok(Ok(capture)) => Self::On { capture },
             Ok(Err(error)) => {
                 tracing::warn!(error = format!("{error:#}"), "sharing without sound");
                 Self::Off
@@ -525,11 +538,14 @@ impl Sink {
                 self.fps,
                 kbps(height, None),
             )?;
-            self.video = Some(Video {
+            let moved = self.video.replace(Video {
                 sender,
                 encoder,
                 sound,
             });
+            if let Some(moved) = moved {
+                moved.sound.stop_aside();
+            }
         }
         let Some(video) = self.video.as_mut() else {
             return Ok(());
