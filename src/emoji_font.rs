@@ -187,13 +187,14 @@ fn glyf(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
     out
 }
 
-/// Where each glyph's outline is in `glyf`, in halves of its offset, as
-/// `head` says: `.notdef`'s empty, then each emoji's.
+/// Where each glyph's outline is in `glyf`, in 32-bit offsets, as `head`
+/// says: `.notdef`'s empty, then each emoji's. The 16-bit halves of offsets
+/// of the short format reach only 5041 emoji.
 fn loca(glyphs: &[(char, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
-    put16(&mut out, 0);
+    put32(&mut out, 0);
     for index in 0..=glyphs.len() {
-        put16(&mut out, (index * OUTLINE / 2) as u16);
+        put32(&mut out, (index * OUTLINE) as u32);
     }
     out
 }
@@ -343,7 +344,8 @@ fn head(advance: i16) -> Vec<u8> {
     put16(&mut out, 0);
     put16(&mut out, 8);
     put16(&mut out, 2);
-    put16(&mut out, 0);
+    // `loca`'s offsets are 32-bit, on macOS, where there's one.
+    put16(&mut out, u16::from(cfg!(target_os = "macos")));
     put16(&mut out, 0);
     out
 }
@@ -471,5 +473,19 @@ mod tests {
             0xB1B0_AFBA,
             "the head checksum adjustment balances"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finds_outlines_past_where_short_offsets_reach() {
+        let glyphs: Vec<(char, Vec<u8>)> = (0..6000)
+            .map(|index| (char::from_u32(0x10_0000 + index).unwrap(), vec![1, 2, 3]))
+            .collect();
+        let font = build("Test", &glyphs);
+        assert_eq!(table(&font, b"head")[50..52], [0, 1], "32-bit offsets");
+        let loca = table(&font, b"loca");
+        assert_eq!(loca.len(), 4 * (glyphs.len() + 2));
+        let end = u32::from_be_bytes(loca[loca.len() - 4..].try_into().unwrap());
+        assert_eq!(end as usize, table(&font, b"glyf").len());
     }
 }
