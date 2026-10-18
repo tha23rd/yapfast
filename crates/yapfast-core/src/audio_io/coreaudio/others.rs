@@ -1,15 +1,19 @@
 //! Other applications' sound, for Go Live, through a Core Audio process tap,
-//! from macOS 14.2 on: one stream of everything the system plays but the
-//! processes the tap leaves out, as Windows's process loopback mixes it. The
-//! tap is the only input of a private aggregate device, which runs at
-//! [`RATE`], so Core Audio resamples the mix there; the device's IOProc hands
-//! each buffer as it is to `heard`, on Core Audio's own thread.
+//! from macOS 14.2 on: a stereo mix of the processes it names, as one
+//! stream, as Windows's process loopback gives it. It names every process
+//! using sound but Yapfast's own and those whose program or bundle id `skip`
+//! picks. Leaving processes out instead would let Yapfast's own through: a
+//! process has a process object only once it starts using sound, too late to
+//! leave out its first moments. Core Audio says when the list of process
+//! objects changes, and the tap gets the new names; a process that just
+//! started may lose its first moments instead.
 //!
-//! The tap leaves out Yapfast's own processes, and those whose program or
-//! bundle id `skip` picks. It names them by their process objects, and a
-//! process gets one only once it uses sound, so the list of them is looked at
-//! again every half second, and the tap is told when what it leaves out
-//! changes.
+//! The tap is the only input of a private aggregate device run at [`RATE`],
+//! so Core Audio resamples the mix there. The device's IOProc, on Core
+//! Audio's real-time thread, copies each buffer into a ring and wakes the
+//! thread `others` started, which hands it to `heard`; neither takes a lock.
+//! A device whose IOProc stops being called, as after the Mac sleeps or Core
+//! Audio restarts, or whose format changes, is made again.
 //!
 //! macOS asks the person once whether Yapfast may record what other
 //! applications play, naming why from `NSAudioCaptureUsageDescription`, and
@@ -22,28 +26,31 @@
 
 use std::{
     ffi::{CStr, c_void},
-    ptr::{NonNull, null},
+    panic::AssertUnwindSafe,
+    ptr::{NonNull, null, null_mut},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
-    thread::JoinHandle,
+    thread::{JoinHandle, Thread},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use objc2::{
     AnyThread as _,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyClass, AnyObject},
 };
 use objc2_core_audio::{
     AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart,
     AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
-    AudioObjectID, AudioObjectSetPropertyData, CATapDescription, kAudioAggregateDeviceIsPrivateKey,
-    kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey,
+    AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectPropertySelector, AudioObjectSetPropertyData, CATapDescription,
+    kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceNameKey,
+    kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePermissionsError, kAudioDevicePropertyBufferFrameSize,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
     kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioObjectUnknown,
@@ -61,16 +68,27 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
 use super::{address, check, data, number, objects, string};
 use crate::audio_io::{Hear, Heard, RATE};
 
-/// How often the thread looks for `stop`.
+/// How long the thread waits for sound before it looks at `stop`.
 const STOP_CHECK: Duration = Duration::from_millis(100);
-/// How often it looks for processes that started or stopped using sound.
+/// How often it looks at the list of processes when Core Audio won't say
+/// that it changed.
 const LOOK: Duration = Duration::from_millis(500);
+/// How often it looks at the device, and how long the IOProc may go uncalled
+/// before the device counts as stopped.
+const CHECK: Duration = Duration::from_secs(1);
+const STALLED: Duration = Duration::from_secs(2);
+/// How long the device may take to run at [`RATE`].
+const RATE_WAIT: Duration = Duration::from_secs(1);
+/// The frames of each IOProc call: 20 ms, one of the mixer's frames.
+const BUFFER_FRAMES: u32 = RATE / 50;
+/// The samples the ring holds: 100 ms, five IOProc calls.
+const RING: usize = RATE as usize / 10 * 2;
+/// What a change to the tap fails with when nobody answered macOS's
+/// question in time: `MACH_RCV_TIMED_OUT`.
+const TIMED_OUT: i32 = 0x1000_4003;
 
 type CreateTap = unsafe extern "C-unwind" fn(*const CATapDescription, *mut AudioObjectID) -> i32;
 type DestroyTap = unsafe extern "C-unwind" fn(AudioObjectID) -> i32;
-
-/// Where the IOProc hands what the tap hears, until it's taken away.
-type Hearing = Mutex<Option<Hear>>;
 
 pub fn others(
     skip: fn(&str) -> bool,
@@ -83,22 +101,14 @@ pub fn others(
     let thread = std::thread::Builder::new()
         .name("yapfast-stream-hear".into())
         .spawn(move || {
-            let mut tap = match Tap::open(taps, skip, heard) {
+            let hearing = Hearing::new(taps, skip);
+            match hearing.open() {
                 Ok(tap) => {
                     let _ = opened.send(Ok(()));
-                    tap
+                    hearing.run(tap, heard, &stop);
                 }
                 Err(error) => {
                     let _ = opened.send(Err(error));
-                    return;
-                }
-            };
-            let mut looked = Instant::now();
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(STOP_CHECK);
-                if looked.elapsed() >= LOOK {
-                    looked = Instant::now();
-                    tap.look();
                 }
             }
         })
@@ -142,27 +152,249 @@ impl Taps {
     }
 }
 
+/// Bumped whenever Core Audio's list of process objects changes.
+static PROCESSES_CHANGED: AtomicU64 = AtomicU64::new(0);
+/// The threads hearing, woken when it does.
+static HEARING: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
+
+/// Has Core Audio say when its list of process objects changes, once for as
+/// long as this process runs; false when it won't.
+fn listen() -> bool {
+    static LISTENING: OnceLock<bool> = OnceLock::new();
+    *LISTENING.get_or_init(|| {
+        // SAFETY: a listener that touches only statics.
+        let status = unsafe {
+            AudioObjectAddPropertyListener(
+                kAudioObjectSystemObject as AudioObjectID,
+                NonNull::from(&global(kAudioHardwarePropertyProcessObjectList)),
+                Some(processes_changed),
+                null_mut(),
+            )
+        };
+        status == 0
+    })
+}
+
+unsafe extern "C-unwind" fn processes_changed(
+    _: AudioObjectID,
+    _: u32,
+    _: NonNull<AudioObjectPropertyAddress>,
+    _: *mut c_void,
+) -> i32 {
+    PROCESSES_CHANGED.fetch_add(1, Ordering::Relaxed);
+    for thread in HEARING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        thread.unpark();
+    }
+    0
+}
+
+/// What the thread `others` started keeps while it hears.
+struct Hearing {
+    taps: Taps,
+    skip: fn(&str) -> bool,
+    own: Own,
+    ring: Arc<Ring>,
+    /// Core Audio says when the list of processes changes.
+    listening: bool,
+}
+
+impl Hearing {
+    fn new(taps: Taps, skip: fn(&str) -> bool) -> Self {
+        HEARING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(std::thread::current());
+        Self {
+            taps,
+            skip,
+            own: Own::find(),
+            ring: Arc::new(Ring::new()),
+            listening: listen(),
+        }
+    }
+
+    fn open(&self) -> Result<Tap> {
+        autoreleasepool(|_| Tap::open(self.taps, &self.own, self.skip, &self.ring))
+    }
+
+    /// Hands what the tap hears to `heard` until `stop`, following the
+    /// processes that come and go, and making the tap again when its device
+    /// stops or changes.
+    fn run(&self, tap: Tap, mut heard: Hear, stop: &AtomicBool) {
+        heard(Heard::Started {
+            source: 0,
+            process: None,
+        });
+        let mut tap = Some(tap);
+        let mut samples = Vec::with_capacity(RING);
+        // None at first, for a look at what changed while the tap was made.
+        let mut changes = None;
+        let (mut looked, mut checked) = (Instant::now(), Instant::now());
+        let mut calls = (self.ring.calls.load(Ordering::Relaxed), Instant::now());
+        let mut failing = false;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::park_timeout(STOP_CHECK);
+            if self.ring.take(&mut samples) {
+                heard(Heard::Samples {
+                    source: 0,
+                    samples: &samples,
+                });
+            }
+            let changed = Some(PROCESSES_CHANGED.load(Ordering::Relaxed));
+            if let Some(tap) = tap.as_mut()
+                && (changed != changes || !self.listening && looked.elapsed() >= LOOK)
+            {
+                (changes, looked) = (changed, Instant::now());
+                autoreleasepool(|_| tap.look(&self.own, self.skip));
+            }
+            if checked.elapsed() < CHECK {
+                continue;
+            }
+            checked = Instant::now();
+            let called = self.ring.calls.load(Ordering::Relaxed);
+            if called != calls.0 {
+                calls = (called, Instant::now());
+            }
+            let why = match &tap {
+                None => "it couldn't be made",
+                Some(_) if calls.1.elapsed() >= STALLED => "its device stopped",
+                Some(tap) if !tap.device.suits() => "its device's format changed",
+                Some(_) => continue,
+            };
+            tap = None;
+            match self.open() {
+                Ok(made) => {
+                    tracing::info!(why, "hearing other applications again");
+                    tap = Some(made);
+                    calls.1 = Instant::now();
+                    failing = false;
+                }
+                Err(error) if !failing => {
+                    failing = true;
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        why,
+                        "could not hear other applications again"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        drop(tap);
+        heard(Heard::Stopped { source: 0 });
+    }
+}
+
+impl Drop for Hearing {
+    fn drop(&mut self) {
+        let this = std::thread::current().id();
+        HEARING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|thread| thread.id() != this);
+    }
+}
+
+/// What the IOProc heard and the hearing thread hasn't handed on yet: one
+/// writes, the other reads, and neither waits for the other.
+struct Ring {
+    samples: Box<[AtomicU32]>,
+    /// The samples ever written, and ever taken.
+    written: AtomicUsize,
+    taken: AtomicUsize,
+    /// The IOProc's calls, silent or not, to tell a device that stopped.
+    calls: AtomicU64,
+    reader: Thread,
+}
+
+impl Ring {
+    fn new() -> Self {
+        Self {
+            samples: (0..RING).map(|_| AtomicU32::new(0)).collect(),
+            written: AtomicUsize::new(0),
+            taken: AtomicUsize::new(0),
+            calls: AtomicU64::new(0),
+            reader: std::thread::current(),
+        }
+    }
+
+    /// From the IOProc: keeps what fits, whole frames, and wakes the reader.
+    fn put(&self, samples: &[f32]) {
+        let written = self.written.load(Ordering::Relaxed);
+        let free = RING - (written - self.taken.load(Ordering::Acquire));
+        let kept = &samples[..samples.len().min(free) & !1];
+        for (at, sample) in kept.iter().enumerate() {
+            self.samples[(written + at) % RING].store(sample.to_bits(), Ordering::Relaxed);
+        }
+        self.written.store(written + kept.len(), Ordering::Release);
+        self.reader.unpark();
+    }
+
+    /// From the reader: everything waiting, into `into`; false for nothing.
+    fn take(&self, into: &mut Vec<f32>) -> bool {
+        let written = self.written.load(Ordering::Acquire);
+        let taken = self.taken.load(Ordering::Relaxed);
+        into.clear();
+        into.extend(
+            (taken..written)
+                .map(|at| f32::from_bits(self.samples[at % RING].load(Ordering::Relaxed))),
+        );
+        self.taken.store(written, Ordering::Release);
+        !into.is_empty()
+    }
+}
+
+/// Tells Yapfast's own processes: this one, the one that started it, and,
+/// when that one runs this program too, so is Yapfast, the others it started,
+/// such as a worker playing a watched stream.
+struct Own {
+    this: u32,
+    parent: u32,
+    family: bool,
+}
+
+impl Own {
+    fn find() -> Self {
+        let (this, parent) = (std::process::id(), std::os::unix::process::parent_id());
+        let program = path(this);
+        Self {
+            this,
+            parent,
+            family: program.is_some() && program == path(parent),
+        }
+    }
+
+    fn has(&self, pid: u32) -> bool {
+        pid == self.this || pid == self.parent || self.family && parent_of(pid) == Some(self.parent)
+    }
+}
+
 /// The tap and what's made of it, taken apart in this order.
 struct Tap {
     _proc: Proc,
-    _device: Aggregate,
+    device: Aggregate,
     tap: ProcessTap,
     description: Retained<CATapDescription>,
-    skip: fn(&str) -> bool,
-    /// The process objects when last looked at, and those the tap leaves out.
+    /// The process objects when last looked at, and those the tap names.
     processes: Vec<AudioObjectID>,
-    left_out: Vec<AudioObjectID>,
+    included: Vec<AudioObjectID>,
+    /// A change to the names failed, and was logged.
+    warned: bool,
 }
 
 impl Tap {
-    fn open(taps: Taps, skip: fn(&str) -> bool, heard: Hear) -> Result<Self> {
-        let processes = processes()?;
-        let left_out = left_out(&processes, skip);
+    fn open(taps: Taps, own: &Own, skip: fn(&str) -> bool, ring: &Arc<Ring>) -> Result<Self> {
+        let mut processes = self::processes()?;
+        let mut included = self::included(&processes, own, skip);
         // SAFETY: the class is there, as the functions are.
         let description = unsafe {
-            CATapDescription::initStereoGlobalTapButExcludeProcesses(
+            CATapDescription::initStereoMixdownOfProcesses(
                 CATapDescription::alloc(),
-                &numbers(&left_out),
+                &numbers(&included),
             )
         };
         // SAFETY: a description of a tap this process alone sees.
@@ -179,75 +411,72 @@ impl Tap {
             destroy: taps.destroy,
         };
         let device = Aggregate::of(&tap)?;
-        let rate = f64::from(RATE);
-        // SAFETY: the rate is a Float64.
-        check(
-            unsafe {
-                AudioObjectSetPropertyData(
-                    device.0,
-                    NonNull::from(&address(
-                        kAudioDevicePropertyNominalSampleRate,
-                        kAudioObjectPropertyScopeGlobal,
-                    )),
-                    0,
-                    null(),
-                    size_of::<f64>() as u32,
-                    NonNull::from(&rate).cast(),
-                )
-            },
-            "the tap won't run at 48 kHz",
-        )?;
-        ensure!(
-            input_format(device.0).is_some_and(|format| format.mFormatID == kAudioFormatLinearPCM
-                && format.mFormatFlags & kAudioFormatFlagIsFloat != 0
-                && format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-                && format.mBitsPerChannel == 32
-                && format.mChannelsPerFrame == 2
-                && format.mSampleRate == rate),
-            "the tap gives sound in a format Yapfast doesn't take"
-        );
-        let mut proc = Proc::new(device.0, heard)?;
+        device.run()?;
+        let mut proc = Proc::new(device.0, ring.clone())?;
         // The first time, this waits for the person's answer; refused,
         // macOS lets nothing change the tap.
-        describe(tap.id, &description).context(
-            "Yapfast may not record other applications' sound: allow it in System Settings, \
-             Privacy & Security, Screen & System Audio Recording",
-        )?;
+        let mut described = describe(tap.id, &description);
+        if described.is_err_and(|status| !refused(status)) {
+            // A process may have gone meanwhile.
+            processes = self::processes()?;
+            included = self::included(&processes, own, skip);
+            // SAFETY: the description the tap was made from.
+            unsafe { description.setProcesses(&numbers(&included)) };
+            described = describe(tap.id, &description);
+        }
+        match described {
+            Ok(()) => {}
+            Err(status) if refused(status) => bail!(
+                "Yapfast may not record other applications' sound: allow it in System \
+                 Settings, Privacy & Security, Screen & System Audio Recording (Core Audio \
+                 status {status})"
+            ),
+            Err(status) => {
+                bail!("the tap refused the processes to hear (Core Audio status {status})")
+            }
+        }
         proc.start()?;
-        tracing::debug!(left_out = left_out.len(), "hearing other applications");
+        tracing::debug!(processes = included.len(), "hearing other applications");
         Ok(Self {
             _proc: proc,
-            _device: device,
+            device,
             tap,
             description,
-            skip,
             processes,
-            left_out,
+            included,
+            warned: false,
         })
     }
 
-    /// Leaves out processes that started using sound since the last look,
-    /// such as Discord or a Yapfast worker playing a watched stream.
-    fn look(&mut self) {
+    /// Names to the tap the processes that started using sound since the
+    /// last look, and leaves out those that ended.
+    fn look(&mut self, own: &Own, skip: fn(&str) -> bool) {
         let Ok(processes) = processes() else { return };
         if processes == self.processes {
             return;
         }
-        let left_out = left_out(&processes, self.skip);
-        if left_out != self.left_out {
-            // SAFETY: a description this tap was made from.
-            unsafe { self.description.setProcesses(&numbers(&left_out)) };
-            if let Err(error) = describe(self.tap.id, &self.description) {
-                tracing::warn!(
-                    error = format!("{error:#}"),
-                    "could not leave a process out of the shared sound"
-                );
-                return;
-            }
-            tracing::debug!(left_out = left_out.len(), "processes left out changed");
-            self.left_out = left_out;
-        }
+        let included = included(&processes, own, skip);
         self.processes = processes;
+        if included == self.included {
+            return;
+        }
+        // SAFETY: the description the tap was made from.
+        unsafe { self.description.setProcesses(&numbers(&included)) };
+        match describe(self.tap.id, &self.description) {
+            Ok(()) => {
+                tracing::debug!(processes = included.len(), "hearing other processes");
+                self.included = included;
+                self.warned = false;
+            }
+            Err(status) if !self.warned => {
+                self.warned = true;
+                tracing::warn!(
+                    status,
+                    "could not change which processes the shared sound hears"
+                );
+            }
+            Err(_) => {}
+        }
     }
 }
 
@@ -255,38 +484,31 @@ impl Tap {
 fn processes() -> Result<Vec<AudioObjectID>> {
     objects(
         kAudioObjectSystemObject as AudioObjectID,
-        address(
-            kAudioHardwarePropertyProcessObjectList,
-            kAudioObjectPropertyScopeGlobal,
-        ),
+        global(kAudioHardwarePropertyProcessObjectList),
     )
     .context("could not list the processes using sound")
 }
 
-/// The processes to leave out: this one and the Yapfast that started it, as
-/// on Linux, and those whose program or bundle id `skip` picks.
-fn left_out(processes: &[AudioObjectID], skip: fn(&str) -> bool) -> Vec<AudioObjectID> {
-    let own = [std::process::id(), std::os::unix::process::parent_id()];
-    let leaves_out = |process: AudioObjectID| {
-        let Some(pid) = number::<i32>(
-            process,
-            address(kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal),
-        ) else {
+/// The processes to hear: all but Yapfast's own, those whose program or bundle
+/// id `skip` picks, and those that are gone.
+fn included(processes: &[AudioObjectID], own: &Own, skip: fn(&str) -> bool) -> Vec<AudioObjectID> {
+    let heard = |process: AudioObjectID| {
+        let Some(pid) = number::<i32>(process, global(kAudioProcessPropertyPID)) else {
             return false;
         };
-        own.contains(&pid.cast_unsigned())
-            || program(pid).is_some_and(|program| skip(&program))
-            || string(process, kAudioProcessPropertyBundleID)
+        !own.has(pid.cast_unsigned())
+            && !program(pid).is_some_and(|program| skip(&program))
+            && !string(process, kAudioProcessPropertyBundleID)
                 .is_ok_and(|bundle| skip(&bundle.to_string()))
     };
     processes
         .iter()
         .copied()
-        .filter(|&process| leaves_out(process))
+        .filter(|&process| heard(process))
         .collect()
 }
 
-/// The name of the program a process runs.
+/// The name of the program a process runs: its file's, such as `yapfast`.
 fn program(pid: i32) -> Option<String> {
     let mut name = [0u8; 64];
     // SAFETY: a buffer of the size given.
@@ -295,56 +517,81 @@ fn program(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(name).into_owned())
 }
 
+/// The path of the program a process runs.
+fn path(pid: u32) -> Option<Vec<u8>> {
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: a buffer of the size given.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid.cast_signed(),
+            path.as_mut_ptr().cast(),
+            path.len() as u32,
+        )
+    };
+    path.truncate(usize::try_from(length).ok().filter(|&length| length > 0)?);
+    Some(path)
+}
+
+/// The process that started a process.
+fn parent_of(pid: u32) -> Option<u32> {
+    // SAFETY: a plain C struct, which zeroes are valid for.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: room for the information asked for.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid.cast_signed(),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pbi_ppid)
+}
+
 fn numbers(processes: &[AudioObjectID]) -> Retained<NSArray<NSNumber>> {
     let numbers: Vec<_> = processes.iter().map(|&id| NSNumber::new_u32(id)).collect();
     NSArray::from_retained_slice(&numbers)
 }
 
-/// Gives the tap `description`, which macOS refuses while Yapfast may not
-/// record.
-fn describe(tap: AudioObjectID, description: &CATapDescription) -> Result<()> {
-    let description: *const CATapDescription = description;
-    // SAFETY: the property is a CATapDescription, which the tap copies.
-    check(
-        unsafe {
-            AudioObjectSetPropertyData(
-                tap,
-                NonNull::from(&address(
-                    kAudioTapPropertyDescription,
-                    kAudioObjectPropertyScopeGlobal,
-                )),
-                0,
-                null(),
-                size_of_val(&description) as u32,
-                NonNull::from(&description).cast(),
-            )
-        },
-        "the tap refused a change",
+fn global(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    address(selector, kAudioObjectPropertyScopeGlobal)
+}
+
+/// Sets a property of a fixed size; the status when it fails.
+fn set<T>(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    value: &T,
+) -> Result<(), i32> {
+    // SAFETY: a property of the value's size, which Core Audio copies.
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            object,
+            NonNull::from(&global(selector)),
+            0,
+            null(),
+            size_of::<T>() as u32,
+            NonNull::from(value).cast(),
+        )
+    };
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
+/// Gives the tap `description`, which it copies.
+fn describe(tap: AudioObjectID, description: &CATapDescription) -> Result<(), i32> {
+    set(
+        tap,
+        kAudioTapPropertyDescription,
+        &(description as *const CATapDescription),
     )
 }
 
-/// What a device gives its IOProc: its input stream's format.
-fn input_format(device: AudioObjectID) -> Option<AudioStreamBasicDescription> {
-    let streams = objects(
-        device,
-        address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput),
-    )
-    .ok()?;
-    let (storage, size) = data(
-        *streams.first()?,
-        address(
-            kAudioStreamPropertyVirtualFormat,
-            kAudioObjectPropertyScopeGlobal,
-        ),
-    )
-    .ok()?;
-    // SAFETY: storage aligned for any of its parts, holding the description.
-    (size == size_of::<AudioStreamBasicDescription>()).then(|| unsafe {
-        storage
-            .as_ptr()
-            .cast::<AudioStreamBasicDescription>()
-            .read()
-    })
+/// Whether a change to the tap failed because Yapfast may not record, or
+/// because nobody said whether it may.
+fn refused(status: i32) -> bool {
+    status == kAudioDevicePermissionsError || status == TIMED_OUT
 }
 
 /// A process tap, destroyed when dropped.
@@ -409,6 +656,38 @@ impl Aggregate {
         )?;
         Ok(Self(device))
     }
+
+    /// Runs the device at [`RATE`], in the mixer's 20 ms, and waits for it to
+    /// take the rate, which Core Audio may change a moment later.
+    fn run(&self) -> Result<()> {
+        set(
+            self.0,
+            kAudioDevicePropertyNominalSampleRate,
+            &f64::from(RATE),
+        )
+        .map_err(|status| anyhow!("the tap won't run at 48 kHz (Core Audio status {status})"))?;
+        if let Err(status) = set(self.0, kAudioDevicePropertyBufferFrameSize, &BUFFER_FRAMES) {
+            tracing::debug!(status, "the tap keeps its own buffer size");
+        }
+        let deadline = Instant::now() + RATE_WAIT;
+        loop {
+            let format = input_format(self.0);
+            if format.is_some_and(suits) {
+                tracing::debug!(?format, "the tap's device");
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("the tap gives sound in a format Yapfast doesn't take: {format:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Whether the device still gives 32-bit floats, stereo, interleaved,
+    /// at [`RATE`].
+    fn suits(&self) -> bool {
+        input_format(self.0).is_some_and(suits)
+    }
 }
 
 impl Drop for Aggregate {
@@ -418,30 +697,58 @@ impl Drop for Aggregate {
     }
 }
 
-/// The aggregate device's IOProc, and what it hands the sound to: one of the
-/// device's own threads, so under a lock.
+fn suits(format: AudioStreamBasicDescription) -> bool {
+    format.mFormatID == kAudioFormatLinearPCM
+        && format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        && format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        && format.mBitsPerChannel == 32
+        && format.mChannelsPerFrame == 2
+        && format.mSampleRate == f64::from(RATE)
+}
+
+/// What a device gives its IOProc: its input stream's format.
+fn input_format(device: AudioObjectID) -> Option<AudioStreamBasicDescription> {
+    let streams = objects(
+        device,
+        address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput),
+    )
+    .ok()?;
+    let (storage, size) =
+        data(*streams.first()?, global(kAudioStreamPropertyVirtualFormat)).ok()?;
+    // SAFETY: storage aligned for any of its parts, holding the description.
+    (size == size_of::<AudioStreamBasicDescription>()).then(|| unsafe {
+        storage
+            .as_ptr()
+            .cast::<AudioStreamBasicDescription>()
+            .read()
+    })
+}
+
+/// The aggregate device's IOProc, which puts what the device hears in the
+/// ring.
 struct Proc {
     device: AudioObjectID,
     id: AudioDeviceIOProcID,
-    hearing: NonNull<Hearing>,
+    ring: Arc<Ring>,
     started: bool,
 }
 
 impl Proc {
-    fn new(device: AudioObjectID, heard: Hear) -> Result<Self> {
+    fn new(device: AudioObjectID, ring: Arc<Ring>) -> Result<Self> {
         let mut proc = Self {
             device,
             id: None,
-            hearing: NonNull::from(Box::leak(Box::new(Mutex::new(Some(heard))))),
+            ring,
             started: false,
         };
-        // SAFETY: `hearing` outlives the IOProc, which dropping destroys first.
+        // SAFETY: the ring outlives the IOProc: dropping destroys the IOProc
+        // first, and keeps the ring if Core Audio won't let go of it.
         check(
             unsafe {
                 AudioDeviceCreateIOProcID(
                     device,
                     Some(hear),
-                    proc.hearing.as_ptr().cast(),
+                    Arc::as_ptr(&proc.ring).cast_mut().cast(),
                     NonNull::from(&mut proc.id),
                 )
             },
@@ -450,55 +757,38 @@ impl Proc {
         Ok(proc)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<Hear>> {
-        // SAFETY: freed only when dropped.
-        let hearing = unsafe { self.hearing.as_ref() };
-        hearing.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn start(&mut self) -> Result<()> {
-        if let Some(heard) = self.lock().as_mut() {
-            heard(Heard::Started {
-                source: 0,
-                process: None,
-            });
-        }
-        self.started = true;
         // SAFETY: the device's IOProc.
         check(
             unsafe { AudioDeviceStart(self.device, self.id) },
             "the tap won't start",
-        )
+        )?;
+        self.started = true;
+        Ok(())
     }
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        // SAFETY: the device's IOProc; once stopped and destroyed, Core Audio
-        // calls it no more.
-        let released = self.id.is_none()
-            || unsafe {
-                let stopped = AudioDeviceStop(self.device, self.id) == 0;
-                let destroyed = AudioDeviceDestroyIOProcID(self.device, self.id) == 0;
-                stopped && destroyed
-            };
-        // An IOProc still running hears nothing from here on.
-        let heard = self.lock().take();
-        if let Some(mut heard) = heard
-            && self.started
-        {
-            heard(Heard::Stopped { source: 0 });
+        if self.id.is_none() {
+            return;
         }
-        if released {
-            // SAFETY: leaked in `new`, and no longer anyone's.
-            drop(unsafe { Box::from_raw(self.hearing.as_ptr()) });
-        } else {
+        // SAFETY: the device's IOProc; once destroyed, Core Audio calls it
+        // no more.
+        let destroyed = unsafe {
+            if self.started {
+                AudioDeviceStop(self.device, self.id);
+            }
+            AudioDeviceDestroyIOProcID(self.device, self.id) == 0
+        };
+        if !destroyed {
             tracing::warn!("Core Audio didn't let go of the tap's IOProc");
+            std::mem::forget(self.ring.clone());
         }
     }
 }
 
-/// Hands what the tap heard to `heard`: interleaved stereo floats at
+/// Puts what the tap heard in the ring: interleaved stereo floats at
 /// [`RATE`], as the device's format is. Silence through and through means
 /// nothing plays, which the mixer hears as nothing, as elsewhere.
 unsafe extern "C-unwind" fn hear(
@@ -508,35 +798,34 @@ unsafe extern "C-unwind" fn hear(
     _: NonNull<AudioTimeStamp>,
     _: NonNull<AudioBufferList>,
     _: NonNull<AudioTimeStamp>,
-    hearing: *mut c_void,
+    ring: *mut c_void,
 ) -> i32 {
-    // SAFETY: the Proc's, which outlives the IOProc.
-    let hearing = unsafe { &*hearing.cast::<Hearing>() };
-    let mut hearing = hearing.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(heard) = hearing.as_mut() else {
-        return 0;
-    };
-    // SAFETY: the device's input, one buffer for its one stream.
-    let buffer = unsafe {
-        let list = input.as_ref();
-        if list.mNumberBuffers == 0 {
-            return 0;
+    // Nothing may unwind into Core Audio.
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the Proc's, which outlives the IOProc.
+        let ring = unsafe { &*ring.cast::<Ring>() };
+        ring.calls.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the device's input, one buffer for its one stream.
+        let buffer = unsafe {
+            let list = input.as_ref();
+            if list.mNumberBuffers == 0 {
+                return;
+            }
+            list.mBuffers[0]
+        };
+        if buffer.mData.is_null() || buffer.mNumberChannels != 2 {
+            return;
         }
-        list.mBuffers[0]
-    };
-    if buffer.mData.is_null() || buffer.mNumberChannels != 2 {
-        return 0;
-    }
-    // SAFETY: the buffer holds that many bytes of floats, for this call.
-    let samples = unsafe {
-        std::slice::from_raw_parts(
-            buffer.mData.cast::<f32>(),
-            buffer.mDataByteSize as usize / size_of::<f32>(),
-        )
-    };
-    if samples.iter().all(|&sample| sample == 0.0) {
-        return 0;
-    }
-    heard(Heard::Samples { source: 0, samples });
+        // SAFETY: the buffer holds that many bytes of floats, for this call.
+        let samples = unsafe {
+            std::slice::from_raw_parts(
+                buffer.mData.cast::<f32>(),
+                buffer.mDataByteSize as usize / size_of::<f32>(),
+            )
+        };
+        if samples.iter().any(|&sample| sample != 0.0) {
+            ring.put(samples);
+        }
+    }));
     0
 }

@@ -497,9 +497,12 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         hearing.join().unwrap();
         let other = heard.lock().unwrap().clone();
+        // A resampler, as macOS's tap has, rings at the tone's abrupt ends,
+        // below -60 dB, flipping sign at every sample; that isn't the tone.
         let crossings = other
             .chunks_exact(2)
             .map(|pair| pair[0])
+            .filter(|sample| sample.abs() > 1e-3)
             .collect::<Vec<_>>()
             .windows(2)
             .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
