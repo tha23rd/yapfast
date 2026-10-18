@@ -269,48 +269,66 @@ buffers going unnoticed, and an unaligned read of the stream configuration.
 
 A shared screen carries what other applications play, which
 `audio_io/coreaudio/others.rs` hears through a Core Audio process tap, as
-Chromium's tab and system audio capture does on the Mac. Taps came with macOS
-14.2; before it, sharing goes without sound and the worker logs "Yapfast
-shares other applications' sound on macOS 14.2 or later". Yapfast still
-starts there: it looks up `AudioHardwareCreateProcessTap` and
+Chromium captures the system's sound on the Mac. Taps came with macOS 14.2;
+before it, sharing goes without sound and the worker logs "Yapfast shares
+other applications' sound on macOS 14.2 or later". Yapfast still starts
+there: it looks up `AudioHardwareCreateProcessTap` and
 `AudioHardwareDestroyProcessTap` with `dlsym`, and `CATapDescription` by name,
 as it runs, where linking them would stop it starting.
 
-The tap is a private, stereo, global one: everything every process plays,
-whatever device it plays on, but the process objects it names. A private
-aggregate device has it as its only input, with drift compensation, and runs
-at 48 kHz, so Core Audio resamples the mix to Go Live's rate; Yapfast checks
-that the device's input is then 32-bit float stereo, interleaved, at 48 kHz.
-The device's IOProc hands each buffer to the mixer as it is, on Core Audio's
-own thread, except buffers that are silence through and through, so nothing
-is sent while nothing plays, as on Windows. The tap leaves out the stream
-worker and the Yapfast that started it, by process id, and processes whose
-program or bundle id is Yapfast's or a Discord client's, as on Linux: so
-Yapfast's other workers, such as one playing a watched stream (`yapfast`),
-and Discord's (`Discord Helper (Renderer)`, `com.hnc.Discord.helper`). A
-process has a process object only once it uses sound, so the worker looks at
-their list every half second and, when what to leave out changed, gives the
-tap a new description; one read of a property while nothing changes.
+The tap is a private stereo mix of the processes it names, whatever device
+they play on: every process using sound but Yapfast's own and those whose
+program or bundle id is a Discord client's, as on Linux (`Discord Helper
+(Renderer)`, `com.hnc.Discord.helper`). Yapfast's own are the stream worker,
+the Yapfast that started it, and the other processes that one started, such
+as a worker playing a watched stream; a program named `yapfast` is left out
+too. A tap of everything but Yapfast's processes, as Yapfast had first, let
+Yapfast's own sound through: Core Audio makes a process's object only once it
+starts using sound, too late to leave out what it plays first, and the test
+heard its own tone whole. Core Audio says when the list of process objects
+changes, and the worker names the new list to the tap at once, so a process
+that just started may lose its first moments instead: the test's other
+process was named 64 ms after it started, and its tone was heard whole.
+
+A private aggregate device has the tap as its only input, with drift
+compensation, and runs at 48 kHz in 20 ms buffers, so Core Audio resamples
+the mix to Go Live's rate. The worker waits up to a second for the device to
+take the rate, then checks that its input is 32-bit float stereo,
+interleaved, at 48 kHz. The device's IOProc, on Core Audio's real-time
+thread, copies each buffer into a ring of 100 ms and wakes the worker's
+thread, which hands it to the mixer; neither takes a lock, and the IOProc
+catches any panic rather than unwind into Core Audio. Buffers of silence
+through and through are left out, so nothing is sent while nothing plays, as
+on Windows; the resampler rings for about 50 samples at a sound's abrupt
+start and end, below -60 dB. The IOProc runs 50 times a second while nothing
+plays too, so when it goes two seconds without a call, as after the Mac
+sleeps or Core Audio restarts, or the device's format changes, the worker
+makes the tap again; it looks once a second. The ring and its copy take
+77 KB.
 
 macOS asks once whether Yapfast may record other applications' sound, and
-holds the first change to the tap until the person answers, so the first
-share's video waits for the answer too. Refused, a tap hears silence and
+holds the first change to the tap until the person answers, so the share's
+sound starts on a thread of its own and the video goes on meanwhile
+(`SharedSound` in `stream_worker.rs`). Refused, a tap hears silence and
 refuses any change to it with `kAudioDevicePermissionsError`, so the worker
 gives it its description again before starting: refused, it logs where to
 allow it, System Settings → Privacy & Security → Screen & System Audio
 Recording, and shares without sound. Unanswered for about three and a half
-minutes, the change times out (`MACH_RCV_TIMED_OUT`), which the worker
-takes as refused. The permission belongs to Yapfast.app, the worker being one
-of its processes; an unbundled build run over SSH is refused without asking.
+minutes, the change times out (`MACH_RCV_TIMED_OUT`), which counts as refused
+too; any other failure is tried once more with a fresh list of processes. The
+permission belongs to Yapfast.app, the worker being one of its processes; an
+unbundled build run over SSH is refused without asking.
 
 Checked on the MacBook Air (macOS 15.3) with
-`audio_io::tests::hears_other_applications`: run over SSH, unbundled, it
-makes the tap and its device, whose input is then 32-bit float stereo at
-48 kHz, and macOS refuses the change with `kAudioDevicePermissionsError`.
-Run from a copy of Yapfast.app holding the test binary, signed as Yapfast's
-own, macOS asked; nobody was there to answer, and the change timed out
-after 210 seconds. Hearing a tone another process plays, and not this one's,
-still needs the permission allowed.
+`audio_io::tests::hears_other_applications`, run from a copy of Yapfast.app
+holding the test binary, signed as Yapfast's own and allowed to record:
+this process's tone wasn't heard at all (peak 0), and the other process's
+was, whole, at its peak of 0.25, with 879 sign changes above -60 dB in 48,960
+frames, where a second of 440 Hz has 880. The tap of everything but
+Yapfast's processes had heard this process's tone at its full 0.25.
+Unbundled over SSH, macOS refused with
+`kAudioDevicePermissionsError`; from the bundle, before the permission was
+given, it asked, and the change timed out after 210 seconds unanswered.
 
 ## Resources
 
