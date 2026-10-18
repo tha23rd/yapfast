@@ -39,7 +39,7 @@ const BITRATE: i32 = 64_000;
 /// client, whose sound is a call or a stream: Yapfast's other workers, such as
 /// one playing a watched stream, and Discord's own client and those built
 /// on it. macOS names Yapfast's by their program, `yapfast`.
-fn is_discord_client(name: &str) -> bool {
+pub(crate) fn is_discord_client(name: &str) -> bool {
     if name.eq_ignore_ascii_case("yapfast") {
         return true;
     }
