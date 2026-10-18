@@ -1,12 +1,13 @@
 //! Starting Yapfast when the person signs in to their computer: a value in the
-//! registry's Run key on Windows, an XDG autostart entry on Linux. The entry is
-//! the setting, so one turned off in Task Manager, or a deleted file, shows as
-//! off in Settings too. It starts Yapfast with `--background`, in the tray.
+//! registry's Run key on Windows, an XDG autostart entry on Linux, a launchd
+//! agent on macOS. The entry is the setting, so one turned off in Task Manager
+//! or System Settings, or a deleted file, shows as off in Settings too. It
+//! starts Yapfast with `--background`, in the tray.
 
 use std::path::PathBuf;
 
 /// Whether this platform can start Yapfast at sign-in.
-pub const SUPPORTED: bool = cfg!(any(target_os = "linux", windows));
+pub const SUPPORTED: bool = cfg!(any(target_os = "linux", windows, target_os = "macos"));
 
 /// The name the entry goes by: the Run key's value, and the Inno Setup
 /// installer's, which writes the same one.
@@ -47,6 +48,17 @@ fn command() -> std::io::Result<Vec<String>> {
         }
         _ => exe,
     };
+    // Gatekeeper runs a downloaded app that wasn't moved from a read-only
+    // copy in a random folder, which is gone by the next sign-in.
+    if cfg!(target_os = "macos")
+        && program
+            .components()
+            .any(|part| part.as_os_str() == "AppTranslocation")
+    {
+        return Err(std::io::Error::other(
+            "Yapfast runs from a temporary copy; move it to Applications first",
+        ));
+    }
     let mut command = vec![path_text(program)?, "--background".to_owned()];
     let arguments: Vec<String> = std::env::args().collect();
     if let Some(index) = arguments
@@ -96,9 +108,57 @@ fn windows_argument(argument: &str) -> String {
     quoted
 }
 
+/// A launchd agent that runs `command` when the person signs in, as
+/// `~/Library/LaunchAgents` holds them: only in sessions at the screen, not
+/// over SSH, without the limits launchd puts on other jobs, as an app opened
+/// from the Finder has none, for calls, and under the app's name in System
+/// Settings.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent(command: &[String]) -> String {
+    let arguments: String = command
+        .iter()
+        .map(|argument| format!("\t\t<string>{}</string>\n", xml_text(argument)))
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{id}</string>
+	<key>ProgramArguments</key>
+	<array>
+{arguments}	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>{id}</string>
+	</array>
+</dict>
+</plist>
+"#,
+        id = crate::icon::APP_ID,
+    )
+}
+
+/// Text as a property list's XML holds it.
+#[cfg(any(target_os = "macos", test))]
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 use none as platform;
 #[cfg(windows)]
 use windows as platform;
@@ -392,7 +452,165 @@ mod windows {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+
+    use objc2::{msg_send, runtime::AnyClass};
+    use objc2_foundation::{NSString, NSURL};
+
+    // ServiceManagement has been in macOS since 10.6. Only SMAppService, which
+    // reads System Settings' switch, is new, in macOS 13, so it's looked up
+    // when used, and before 13 isn't there.
+    #[link(name = "ServiceManagement", kind = "framework")]
+    unsafe extern "C" {}
+
+    /// `SMAppServiceStatusRequiresApproval`: the person turned the entry off
+    /// in System Settings.
+    const REQUIRES_APPROVAL: isize = 2;
+
+    pub fn enabled() -> bool {
+        agents().is_some_and(|agents| {
+            let path = entry(&agents);
+            path.exists() && allowed(&path)
+        })
+    }
+
+    pub fn write(command: &[String]) -> io::Result<()> {
+        let agents = agents().ok_or_else(|| io::Error::other("no home folder"))?;
+        write_entry(&agents, command)?;
+        // Only the person can turn it on again there, so show them where.
+        if !allowed(&entry(&agents)) {
+            open_login_items();
+            return Err(io::Error::other(
+                "Yapfast is turned off in System Settings, under Login Items",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn remove() -> io::Result<()> {
+        match agents() {
+            Some(agents) => match std::fs::remove_file(entry(&agents)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// `~/Library/LaunchAgents`, whose agents launchd loads as the person
+    /// signs in.
+    fn agents() -> Option<PathBuf> {
+        std::env::home_dir().map(|home| home.join("Library").join("LaunchAgents"))
+    }
+
+    fn entry(agents: &Path) -> PathBuf {
+        agents.join(format!("{}.plist", crate::icon::APP_ID))
+    }
+
+    pub(super) fn write_entry(agents: &Path, command: &[String]) -> io::Result<()> {
+        let path = entry(agents);
+        let text = super::launch_agent(command);
+        // Each start leaves an entry that's already right alone, rather than
+        // have macOS look it over again.
+        if std::fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(agents)?;
+        // Whole or not at all: launchd reading it never sees half.
+        let file = tempfile::NamedTempFile::new_in(agents)?;
+        std::fs::write(file.path(), text)?;
+        file.persist(&path).map(drop).map_err(|error| error.error)
+    }
+
+    /// Whether System Settings lets the entry run. From macOS 13 its Login
+    /// Items list it under Allow in the Background, with a switch; before,
+    /// an entry that's there runs.
+    fn allowed(path: &Path) -> bool {
+        let Some(service) = AnyClass::get(c"SMAppService") else {
+            return true;
+        };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        // SAFETY: the class method takes a file URL and returns an
+        // SMAppServiceStatus, an NSInteger.
+        let status: isize = unsafe { msg_send![service, statusForLegacyURL: &*url] };
+        // A new entry reads as not found for a moment, until macOS has
+        // looked it over, then as enabled.
+        status != REQUIRES_APPROVAL
+    }
+
+    /// Opens System Settings at Login Items, from macOS 13.
+    fn open_login_items() {
+        if let Some(service) = AnyClass::get(c"SMAppService") {
+            // SAFETY: a class method without arguments that returns nothing.
+            let () = unsafe { msg_send![service, openSystemSettingsLoginItems] };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use serde_json::{Value, json};
+
+        use super::*;
+
+        /// The entry as macOS's own property list parser reads it.
+        fn read(agents: &Path) -> Value {
+            let output = std::process::Command::new("plutil")
+                .args(["-convert", "json", "-o", "-"])
+                .arg(entry(agents))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            serde_json::from_slice(&output.stdout).unwrap()
+        }
+
+        #[test]
+        fn writes_an_agent_launchd_reads() {
+            let agents = tempfile::tempdir().unwrap();
+            let command = [
+                "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast".to_owned(),
+                "--background".to_owned(),
+                "--data-dir".to_owned(),
+                "/Users/a/<data>".to_owned(),
+            ];
+            write_entry(agents.path(), &command).unwrap();
+            let agent = read(agents.path());
+            assert_eq!(agent["Label"], json!(crate::icon::APP_ID));
+            assert_eq!(agent["ProgramArguments"], json!(command));
+            assert_eq!(agent["RunAtLoad"], json!(true));
+            assert_eq!(agent["LimitLoadToSessionType"], json!("Aqua"));
+        }
+
+        /// Writes the person's own LaunchAgents, which System Settings shows,
+        /// and macOS may say so: run it on a Mac you test on.
+        #[test]
+        #[ignore = "writes ~/Library/LaunchAgents"]
+        fn turns_on_and_off_as_system_settings_sees_it() {
+            remove().unwrap();
+            assert!(!enabled());
+            write(&["/Applications/Yapfast.app/Contents/MacOS/yapfast".into()]).unwrap();
+            assert!(enabled());
+            // Each start points it at the Yapfast that's running.
+            super::super::refresh();
+            let program = std::env::current_exe().unwrap();
+            let agents = agents().unwrap();
+            assert_eq!(
+                read(&agents)["ProgramArguments"],
+                json!([program.to_string_lossy(), "--background"])
+            );
+            assert!(enabled());
+            remove().unwrap();
+            assert!(!enabled());
+            assert!(!entry(&agents).exists());
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 mod none {
     pub fn enabled() -> bool {
         false
@@ -411,7 +629,27 @@ mod none {
 
 #[cfg(test)]
 mod tests {
-    use super::windows_argument;
+    use super::{launch_agent, windows_argument};
+
+    #[test]
+    fn writes_a_launch_agent_that_starts_in_the_tray() {
+        let agent = launch_agent(&[
+            "/Applications/A & B/Yapfast.app/Contents/MacOS/yapfast".to_owned(),
+            "--background".to_owned(),
+            "--data-dir".to_owned(),
+            "/Users/a/<data>".to_owned(),
+        ]);
+        assert!(agent.contains(
+            "\t<key>ProgramArguments</key>\n\t<array>\n\
+             \t\t<string>/Applications/A &amp; B/Yapfast.app/Contents/MacOS/yapfast</string>\n\
+             \t\t<string>--background</string>\n\
+             \t\t<string>--data-dir</string>\n\
+             \t\t<string>/Users/a/&lt;data&gt;</string>\n\
+             \t</array>\n"
+        ));
+        assert!(agent.contains("<key>Label</key>\n\t<string>io.github.yapfast.Yapfast</string>"));
+        assert!(agent.contains("<key>RunAtLoad</key>\n\t<true/>"));
+    }
 
     #[test]
     fn quotes_windows_arguments_as_windows_splits_them() {

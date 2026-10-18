@@ -18,16 +18,21 @@ Settings → Advanced → "Start when you sign in" starts Yapfast with
 `--background` when the person signs in to their computer (`src/autostart.rs`).
 The entry is the setting, not `layout.json`: on Windows a value named
 `Yapfast` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, on Linux
-`io.github.yapfast.Yapfast.desktop` in `$XDG_CONFIG_HOME/autostart`. Each
-window reads it, so turning Yapfast off in Task Manager's Startup apps (an odd
-first byte in `Explorer\StartupApproved\Run`), or a desktop setting
-`Hidden=true` or deleting the file, shows as off. Turning it on here clears
-Task Manager's record too. Each start, outside the preview, rewrites an entry
+`io.github.yapfast.Yapfast.desktop` in `$XDG_CONFIG_HOME/autostart`, on macOS
+the launchd agent `~/Library/LaunchAgents/io.github.yapfast.Yapfast.plist`.
+Each window reads it, so turning Yapfast off in Task Manager's Startup apps
+(an odd first byte in `Explorer\StartupApproved\Run`), in System Settings'
+Login Items on macOS 13 and later, or a desktop setting `Hidden=true` or
+deleting the file, shows as off. Turning it on here clears Task Manager's
+record too; on the Mac only the person can turn it on again there, so Yapfast
+opens Login Items for them. Each start, outside the preview, rewrites an entry
 that's on with this Yapfast's path, so moving its folder or an update keeps it
 working. The entry keeps `--data-dir` if Yapfast had one; an AppImage's entry
-names the AppImage, not its temporary mount. The preview, and platforms
-without either, don't show the switch. The Windows installer's "Start Yapfast
-automatically when Windows starts" writes the same value, and uninstalling removes it.
+names the AppImage, not its temporary mount, and a Mac app Gatekeeper runs
+from a temporary copy, as when it wasn't moved out of Downloads, writes none.
+The preview, and platforms without any of these, don't show the switch. The
+Windows installer's "Start Yapfast automatically when Windows starts" writes
+the same value, and uninstalling removes it.
 
 `--background` restores the saved session and goes to the tray without
 showing the window, or shows it when there's no session to restore, since
@@ -35,8 +40,9 @@ signing in needs it. With `--preview` it goes to the tray with the sample
 conversations, which shows a start at sign-in without an account. Windows knows at once whether the icon went into the
 notification area; without it the window shows. On Linux the bus says a
 moment later, and a tray that's missing, or goes while the window is closed,
-opens the window. A window made late, from the tray, fails over to Skia
-Software as the first does when the GPU fails.
+opens the window. The Mac's menu bar always takes the icon. A window made
+late, from the tray, fails over to Skia Software as the first does when the
+GPU fails.
 
 ## The window
 
@@ -153,7 +159,54 @@ when there's none yet the tray puts in one with the same items: About,
 Services, Hide, Hide Others, Show All and Quit. Slint's takes its place once a
 window shows, and stays after it closes.
 
-Starting at sign-in isn't there on macOS yet, so Settings doesn't show it.
+Starting at sign-in is a launchd agent, as Linux's is a desktop entry:
+launchd loads the person's agents as they sign in, and runs this one, which
+is `RunAtLoad`, once. It runs Yapfast's own program inside the app, with
+`--background`, rather than `open -a` through LaunchServices, which would pass
+the arguments only to an app not yet running, and would make `open` the
+program System Settings shows, rather than Yapfast's signature;
+`AssociatedBundleIdentifiers` names the app too. A program launchd starts is
+responsible for itself, as one the Finder opens is, so macOS asks for the
+microphone, and keeps notifications, for Yapfast itself, as it would not for
+one started from a terminal. `LimitLoadToSessionType` keeps it to sessions at
+the screen, not SSH ones, and `ProcessType` `Interactive` gives it what an
+app opened from the Finder has, for calls. Each start leaves an entry that's
+already right alone.
+
+From macOS 13, System Settings → General → Login Items lists the agent under
+Allow in the Background, with a switch, and macOS says so in a notification,
+Background Items Added, when it's first written.
+`+[SMAppService statusForLegacyURL:]` reads the switch: "requires approval"
+when the person turned it off. A new entry reads "not found" for about a
+second, until macOS has looked it over, then "enabled", so only "requires
+approval" counts as off.
+SMAppService is new in macOS 13, so Yapfast looks the class up by name, and
+before 13 the file alone is the setting. The other way was
+`SMAppService.mainApp`, macOS 13's login item for the app itself: it passes no
+arguments, so Yapfast would have to tell a start at sign-in from its launch
+Apple event before `ui::run` decides whether to show the window, and it isn't
+there on macOS 11 or 12.
+
+Checked on a MacBook Air (M4, macOS 15.3), with the disk image's app carrying
+this build, outside Applications:
+
+- `autostart::macos::tests::writes_an_agent_launchd_reads` writes an agent
+  that `plutil` reads back; `turns_on_and_off_as_system_settings_sees_it`,
+  ignored since it writes `~/Library/LaunchAgents`, turns it on, points it at
+  the test with `refresh()`, and off.
+- Started against a test server on 127.0.0.1, with an entry naming another
+  folder, Yapfast rewrote it with its own program and `--data-dir`, and
+  `statusForLegacyURL:` said enabled.
+- `launchctl bootstrap` of that entry, with `--preview` and a data folder of
+  its own, as signing in loads it: launchd started Yapfast, which had only its
+  menu bar icon on screen, no window, was responsible for itself, and logged
+  to its data folder. The app menu held all six items, and Command-Q, sent
+  through `-[NSApplication sendEvent:]`, quit it through
+  `applicationShouldTerminate:` with exit code 0; without the app menu it did
+  nothing. NSRunningApplication's `terminate`, as Quit in the Dock does, quit
+  it the same way, and launchd didn't start it again.
+- Turning it off in System Settings, and a real sign-in, need someone at the
+  Mac.
 
 ## Testing
 

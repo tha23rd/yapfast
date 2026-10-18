@@ -5,8 +5,8 @@ other platforms' releases it's the Discord flavour; `scripts/build-macos full`
 builds the full preview with Matrix. It uses Slint with Skia, as everywhere,
 LiveKit's macOS libwebrtc, and macOS's own services for what the other
 platforms do in their own: Audio Queue Services for sound, the menu bar for
-the tray, Notification Center for notifications and the Keychain for the
-Discord token.
+the tray, Notification Center for notifications, the Keychain for the
+Discord token and a launchd agent for starting at sign-in.
 
 ## Run the package
 
@@ -24,16 +24,20 @@ Discord token.
    may record what other applications play, naming why from
    `NSAudioCaptureUsageDescription`; without it, the stream has no sound.
 
-Opened from the Finder or the Dock, Yapfast's output goes nowhere, so it
-writes its diagnostics to `yapfast.log` in its data folder,
+Settings → Advanced → "Start when you sign in" writes
+`~/Library/LaunchAgents/io.github.yapfast.Yapfast.plist`, which starts Yapfast
+in the menu bar as the person signs in; turned off in System Settings → General
+→ Login Items, it shows as off ([the tray](tray.md#macos) has how).
+
+Opened from the Finder or the Dock, or at sign-in, Yapfast's output goes
+nowhere, so it writes its diagnostics to `yapfast.log` in its data folder,
 `~/Library/Application Support/io.github.yapfast.Yapfast`, as it does on
 Windows; started from a terminal, as
 `/Applications/Yapfast.app/Contents/MacOS/yapfast`, it writes there instead.
 Yapfast renders with Skia Software; `--renderer gpu` draws with Skia on Metal.
 
 Not there yet on the Mac: cameras (`camera.rs` captures through V4L2 and
-DirectShow only) and starting at sign-in. Each is hidden or says so where it
-would be.
+DirectShow only). It says so where it would be.
 
 ## Build
 
@@ -322,7 +326,7 @@ took 156 MB and 72 MB.
 ## Checks
 
 On the MacBook Air, with the `fast` profile, the whole workspace's tests pass
-for the Discord flavour (100 in the app, 234 in `yapfast-core`, 164 in
+for the Discord flavour (103 in the app, 243 in `yapfast-core`, 164 in
 `yapfast-discord`), as does Clippy with warnings denied for it and for the
 full flavour. `scripts/test-fake-discord`, run with `IN_NIX_SHELL=1` and Bun
 from mise, passes its Discord service and `discord_text` tests; its example
