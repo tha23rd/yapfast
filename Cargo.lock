@@ -6166,6 +6166,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-core-audio-types",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -11536,6 +11537,7 @@ dependencies = [
  "gif",
  "image",
  "keyring",
+ "libc",
  "libpulse-binding",
  "libpulse-simple-binding",
  "livekit",
@@ -11549,10 +11551,12 @@ dependencies = [
  "mime",
  "ndarray",
  "nnnoiseless",
+ "objc2 0.6.4",
  "objc2-audio-toolbox",
  "objc2-core-audio",
  "objc2-core-audio-types",
  "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
  "png",
  "pulldown-cmark",
  "rand 0.9.5",

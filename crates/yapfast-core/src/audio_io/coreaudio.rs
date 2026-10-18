@@ -1052,10 +1052,6 @@ fn string(
 }
 
 #[cfg(feature = "discord")]
-pub fn others(
-    _: fn(&str) -> bool,
-    _: super::Hear,
-    _: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<std::thread::JoinHandle<()>> {
-    bail!("Yapfast shares sound on Linux and Windows only for now")
-}
+mod others;
+#[cfg(feature = "discord")]
+pub use others::others;

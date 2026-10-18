@@ -48,5 +48,5 @@ pub fn others(
     _: super::Hear,
     _: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
-    bail!("Yapfast shares sound on Linux only for now")
+    bail!("Yapfast shares sound on Linux, Windows and macOS only for now")
 }

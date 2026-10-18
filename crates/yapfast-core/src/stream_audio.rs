@@ -38,9 +38,9 @@ const BITRATE: i32 = 64_000;
 /// Whether an application, by its name or program, is Yapfast or a Discord
 /// client, whose sound is a call or a stream: Yapfast's other workers, such as
 /// one playing a watched stream, and Discord's own client and those built
-/// on it.
+/// on it. macOS names Yapfast's by their program, `yapfast`.
 fn is_discord_client(name: &str) -> bool {
-    if name == "Yapfast" {
+    if name.eq_ignore_ascii_case("yapfast") {
         return true;
     }
     let name = name.to_lowercase();
@@ -441,9 +441,12 @@ mod tests {
     fn leaves_out_other_discord_clients() {
         for client in [
             "Yapfast",
+            "yapfast",
             "Discord",
             "DiscordCanary",
             ".Discord-wrapped",
+            "Discord Helper (Renderer)",
+            "com.hnc.Discord.helper",
             "vesktop",
             "Equibop",
             "WebCord",

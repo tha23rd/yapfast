@@ -7,8 +7,8 @@
 //! copy of their own.
 //!
 //! Linux goes through PulseAudio, or PipeWire's PulseAudio server, Windows
-//! through WASAPI, and macOS through Audio Queue Services. Other systems have
-//! no sound here yet.
+//! through WASAPI, and macOS through Audio Queue Services, and Core Audio for
+//! other applications' sound. Other systems have no sound here yet.
 
 use std::{marker::PhantomData, time::Duration};
 #[cfg(feature = "discord")]
@@ -204,8 +204,6 @@ impl<S: Sample> Input<S> {
 
 /// What [`others`] hears from the other applications playing.
 #[cfg(feature = "discord")]
-// macOS hears no other applications yet.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub enum Heard<'a> {
     /// An application started playing, from this process when the system says.
     Started {
@@ -225,7 +223,8 @@ pub enum Heard<'a> {
 /// Hears what every other application plays, at [`RATE`] in stereo, on a
 /// thread of its own until `stop`. Yapfast's own processes are left out. On
 /// Linux each application comes on its own, and those whose name or program
-/// `skip` picks are left out too; Windows mixes them all into one.
+/// `skip` picks are left out too; Windows mixes them all into one, and macOS
+/// too, leaving out those whose program or bundle id `skip` picks.
 /// Returns once it hears, or with why it can't.
 #[cfg(feature = "discord")]
 pub fn others(
