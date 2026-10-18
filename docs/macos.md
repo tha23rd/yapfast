@@ -121,37 +121,57 @@ decodes those through the system instead, where FFmpeg has no decoder:
 - `native/videotoolbox.c` decodes H264 with a VideoToolbox session, on the
   hardware decoder, synchronously on the caller's thread. An MP4 file's avcC
   box gives it the parameter sets; a Go Live stream's come in its Annex B
-  access units, which it rewrites with lengths. It keeps the sets by kind and
-  id, and starts a new session when one changes, whether in the stream, in an
-  MP4 file's samples or in a new sample description; after a seek, so the
-  pictures after the keyframe can't refer to any from before; and when
+  access units, which it rewrites with lengths. It keeps the sets under their
+  ids, as many as H264 has and none longer than 4 KiB, and makes each session
+  from the picture parameter set a slice refers to and the sequence one that
+  refers to, so a sender that gives each size sets of new ids, as OpenH264
+  can, and a damaged set under an id of its own, change nothing else. A new
+  session starts when those sets change, in the stream, in an MP4 file's
+  samples or in a new sample description, but only at an IDR or intra-coded
+  picture, as the pictures before one refer to what the session decoded:
+  VideoToolbox says a session can take a format of new ids of the same size,
+  but then decodes none of the pictures after. One starts too after a seek,
+  so the pictures after the keyframe can't refer to any from before, and when
   VideoToolbox says the session stopped working, as after the Mac sleeps,
-  decoding the access unit again. VideoToolbox gives pictures in decode
-  order, so it holds back as many as B-frames reorder by and gives them by
-  presentation time: as many as MP4's demuxer counts (`video_delay`), or for
-  another file, as a Matroska or a fragmented MP4 one, as many as the
-  sequence parameter set's VUI says, none for the Baseline profile, and two
-  when it doesn't say. A picture that comes after a later one has shown is
-  left out and one more is held back from then on. The pictures an MP4 edit
-  list cuts, as from a trimmed iPhone clip, are decoded for the ones that
-  refer to them but don't show. libyuv makes its NV12 the I420 `video.c` and
-  `decode.c` take, the range from the pixel format and the matrix from the
-  buffer's attachment.
+  decoding the access unit again when it's such a picture, and otherwise from
+  the next one; a session that keeps stopping starts again once a second at
+  most. VideoToolbox gives pictures in decode order, so it holds back as many
+  as B-frames reorder by and gives them by presentation time: as many as
+  MP4's demuxer counts (`video_delay`), or for another file, as a Matroska or
+  a fragmented MP4 one, as many as the sequence parameter set's VUI says,
+  none for the Baseline profile, and two when it doesn't say. Pictures from
+  before an IDR picture go before any after it, whatever their times say,
+  and a picture that shows before the last one given, but after the one
+  before that, came too late: it's left out and one more is held back from
+  then on. One further back is where a file's times jump back, as in a
+  joined Matroska file, and plays. The pictures an MP4 edit list cuts, as
+  from a trimmed iPhone clip, are decoded for the ones that refer to them
+  but don't show. libyuv makes its NV12 the I420 `video.c` and `decode.c`
+  take, the range from the pixel format and the matrix from the buffer's
+  attachment.
 - `native/audiotoolbox.c` decodes AAC with an `AudioConverter`, taking the
   AudioSpecificConfig wrapped in an ES descriptor, as FFmpeg's own
   AudioToolbox decoder does, and the richest format it describes, so HE-AAC
-  comes out at its full rate. Surround comes out in FFmpeg's order, left and
-  right first, by the output channel layout it asks for, rather than AAC's,
-  centre first. The converter gives each packet's samples as it takes the
+  comes out at its full rate. Surround comes out in the order of FFmpeg 8,
+  the archive's, left and right first, rather than AAC's, centre first, by
+  the output layout it asks the converter for, chosen from the one the
+  converter gives: from 3.0 to 7.1 the levels of each channel match FFmpeg's
+  decoder to a tenth of a decibel. For channel configuration 7, which
+  FFmpeg's encoder writes for 7.1, FFmpeg takes the first pair of fronts as
+  left and right and the outer pair as the sides, which it names channel by
+  channel. AudioToolbox doesn't open AAC with a program config element, as
+  FFmpeg's encoder writes 6.1 and the wide 7.1 layouts; those videos play
+  without sound. The converter gives each packet's samples as it takes the
   packet, from the first: the onset of a tone half a second in lands on the
   same sample as with FFmpeg's decoder. `video.c` trims the encoder's priming
   and padding by the demuxer's skip-samples marks, counting the priming down
   across packets, and decodes but leaves out the packets an edit list cuts,
-  as FFmpeg's decoders do.
+  as FFmpeg's decoders do, reading the marks as they do: priming of 2^31
+  samples or more as none, and padding longer than the packet as none.
 - A frame that doesn't decode, as after a frame lost, makes `decode.c` say so:
   VideoToolbox fails every one after a lost reference until the next
-  keyframe, which watching a stream then asks for. A camera's decoder goes on
-  to that keyframe.
+  keyframe, which watching a stream then asks for. A camera starts again
+  from that keyframe with a new decoder.
 
 VP8, VP9 and AV1 go through libvpx and dav1d from the archive, as elsewhere,
 and the favourite GIFs' VP9 clips with them.

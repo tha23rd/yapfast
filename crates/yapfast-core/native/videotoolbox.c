@@ -13,19 +13,24 @@
 #include <VideoToolbox/VideoToolbox.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "libyuv/convert.h"
 
 /* The widest or tallest picture, as in video.c and decode.c. */
 enum { MAX_SIDE = 8192 };
 /* H264 reorders by 16 pictures at most; one more comes before the first
- * goes. Streams have a parameter set or two of each kind. */
-enum { MAX_HELD = 17, MAX_SETS = 8 };
+ * goes. */
+enum { MAX_HELD = 17 };
 /* How many pictures to hold back when neither the caller nor the stream
  * says: as many as x264's B-frames reorder by. A stream that reorders by
  * more raises it as it plays, a picture lost each time. */
 enum { GUESSED_DELAY = 2 };
-enum { SPS = 7, PPS = 8, ACCESS_UNIT_DELIMITER = 9 };
+/* H264's ids of sequence and picture parameter sets, and the longest set
+ * kept: real ones are far shorter, and this way a stream can't make a
+ * decoder keep more than about a megabyte of them. */
+enum { SPS_IDS = 32, PPS_IDS = 256, MAX_SET = 4096 };
+enum { SLICE = 1, IDR = 5, SPS = 7, PPS = 8, ACCESS_UNIT_DELIMITER = 9 };
 
 /* The profiles whose sequence parameter sets say their chroma format and
  * bit depths, and may carry scaling matrices. */
@@ -34,26 +39,44 @@ static const uint8_t HIGH_PROFILES[] = {100, 110, 122, 244, 44,  83,  86,
 
 struct set {
   uint8_t *data;
-  size_t size;
-  int kind;
-  unsigned id;
+  uint16_t size;
+  /* For a picture parameter set, the sequence one it refers to. */
+  uint8_t sps;
+  /* Which of the sets kept this is, to tell when the one under an id changes. */
+  uint32_t stamp;
 };
 
 struct held {
   CVPixelBufferRef buffer;
   int64_t time;
+  /* How many IDR pictures came before it: none decoded after one shows
+   * before any decoded before it, whatever their times say. */
+  uint32_t epoch;
+};
+
+/* What an access unit's first slice says. */
+struct slice {
+  unsigned pps;
+  int idr;
+  /* An IDR or intra-coded picture, which a new session can start from. */
+  int starts;
 };
 
 struct yapfast_vt {
   VTDecompressionSessionRef session;
+  /* What the session decodes with, made from the sets with these stamps. */
   CMVideoFormatDescriptionRef format;
+  uint32_t format_sps, format_pps;
   int annexb;
   /* The bytes of each NAL unit's length in what VideoToolbox gets. */
   int length_size;
-  struct set sets[MAX_SETS];
-  int set_count;
-  /* The parameter sets changed since the session started. */
-  int changed;
+  struct set sps[SPS_IDS];
+  struct set pps[PPS_IDS];
+  uint32_t stamps;
+  /* A session stopped working or couldn't start, and when the last one
+   * started. */
+  int stopped;
+  double started;
   /* Pictures decoded and not yet given, in the order they show. */
   struct held held[MAX_HELD];
   int held_count;
@@ -61,8 +84,12 @@ struct yapfast_vt {
   int asked;
   int delay;
   int draining;
-  /* When the last picture given shows. */
+  uint32_t epoch;
+  /* When the last picture given and the one before it show, and how many
+   * IDR pictures came before the last. */
   int64_t shown;
+  int64_t before;
+  uint32_t shown_epoch;
   /* What VideoToolbox said as it gave the last access unit's picture. */
   OSStatus status;
   /* An Annex B access unit, rewritten with lengths. */
@@ -73,19 +100,20 @@ struct yapfast_vt {
   size_t planes_size;
 };
 
-/* A NAL unit's bits, without its header and the bytes that keep start codes
- * out of it. A parameter set is far shorter; what's past the end reads as
- * zeros, and `at` past it says so. */
+/* A NAL unit's first bits, without its header and the bytes that keep start
+ * codes out of it. A parameter set is far shorter; what's past the end reads
+ * as zeros, and `at` past it says so. */
 struct bits {
   uint8_t data[256];
   size_t size;
   size_t at;
 };
 
-static void unescape(struct bits *bits, const uint8_t *nal, size_t size) {
+/* Takes up to `limit` bytes of the NAL unit, as many as what's read needs. */
+static void unescape(struct bits *bits, const uint8_t *nal, size_t size, size_t limit) {
   bits->size = bits->at = 0;
   int zeros = 0;
-  for (size_t index = 1; index < size && bits->size < sizeof bits->data; index++) {
+  for (size_t index = 1; index < size && bits->size < limit; index++) {
     if (zeros >= 2 && nal[index] == 3) {
       zeros = 0;
       continue;
@@ -136,7 +164,7 @@ static void skip_hrd(struct bits *bits) {
  * when it doesn't say. */
 static int reorder_of(const struct set *sps) {
   struct bits bits;
-  unescape(&bits, sps->data, sps->size);
+  unescape(&bits, sps->data, sps->size, sizeof bits.data);
   unsigned profile = read_bits(&bits, 8);
   if (profile == 66) return 0;
   /* The constraints, the level and the set's id. */
@@ -206,13 +234,26 @@ static int reorder_of(const struct set *sps) {
   return bits.at <= bits.size * 8 ? said : -1;
 }
 
-/* A parameter set's id: a picture parameter set's first field, a sequence
- * parameter set's after its profile and level. */
-static unsigned set_id(const uint8_t *data, size_t size) {
+/* Reads which picture parameter set a slice refers to and whether a session
+ * can start from it: 0 when it's damaged. */
+static int read_slice(const uint8_t *nal, size_t size, struct slice *slice) {
   struct bits bits;
-  unescape(&bits, data, size);
-  if ((data[0] & 0x1f) == SPS) read_bits(&bits, 24);
-  return ue(&bits);
+  unescape(&bits, nal, size, 16);
+  /* The first macroblock, the slice's type, I and SI being intra-coded, and
+   * the set. */
+  ue(&bits);
+  unsigned type = ue(&bits) % 5;
+  slice->pps = ue(&bits);
+  slice->idr = (nal[0] & 0x1f) == IDR;
+  slice->starts = slice->idr || type == 2 || type == 4;
+  return bits.at <= bits.size * 8 && slice->pps < PPS_IDS;
+}
+
+/* A clock for how often sessions start. */
+static double now(void) {
+  struct timespec moment;
+  clock_gettime(CLOCK_MONOTONIC, &moment);
+  return (double)moment.tv_sec + (double)moment.tv_nsec / 1e9;
 }
 
 static void release_held(struct yapfast_vt *vt) {
@@ -230,13 +271,15 @@ static void end_session(struct yapfast_vt *vt) {
     CFRelease(vt->format);
     vt->format = NULL;
   }
+  vt->format_sps = vt->format_pps = 0;
 }
 
 void yapfast_vt_free(struct yapfast_vt *vt) {
   if (!vt) return;
   end_session(vt);
   release_held(vt);
-  for (int index = 0; index < vt->set_count; index++) free(vt->sets[index].data);
+  for (int id = 0; id < SPS_IDS; id++) free(vt->sps[id].data);
+  for (int id = 0; id < PPS_IDS; id++) free(vt->pps[id].data);
   free(vt->unit);
   free(vt->planes);
   free(vt);
@@ -254,87 +297,63 @@ static void decoded(void *opaque, void *cut, OSStatus status, VTDecodeInfoFlags 
   if (status != noErr || !image || cut || vt->held_count == MAX_HELD) return;
   int64_t shows = CMTIME_IS_NUMERIC(time) ? time.value : YAPFAST_VT_NO_TIME;
   int at = vt->held_count;
-  while (shows != YAPFAST_VT_NO_TIME && at > 0 && vt->held[at - 1].time != YAPFAST_VT_NO_TIME &&
-         vt->held[at - 1].time > shows) {
+  while (shows != YAPFAST_VT_NO_TIME && at > 0 && vt->held[at - 1].epoch == vt->epoch &&
+         vt->held[at - 1].time != YAPFAST_VT_NO_TIME && vt->held[at - 1].time > shows) {
     vt->held[at] = vt->held[at - 1];
     at--;
   }
-  vt->held[at] = (struct held){CVPixelBufferRetain(image), shows};
+  vt->held[at] = (struct held){CVPixelBufferRetain(image), shows, vt->epoch};
   vt->held_count++;
 }
 
-/* Whether there are parameter sets of both kinds to decode with. */
-static int has_sets(const struct yapfast_vt *vt) {
-  int kinds = 0;
-  for (int index = 0; index < vt->set_count; index++) {
-    kinds |= vt->sets[index].kind == SPS ? 1 : vt->sets[index].kind == PPS ? 2 : 0;
-  }
-  return kinds == 3;
-}
-
-/* Keeps a parameter set in place of the one of its kind and id, the sets
- * changing when it's new; -1 without memory. */
+/* Keeps a parameter set under its id, in place of the one before. One too
+ * long, damaged, or with an id H264 doesn't have is left out; -1 without
+ * memory. */
 static int keep_set(struct yapfast_vt *vt, const uint8_t *data, size_t size) {
+  if (size > MAX_SET) return 0;
   int kind = data[0] & 0x1f;
-  unsigned id = set_id(data, size);
-  int at = vt->set_count;
-  for (int index = 0; index < vt->set_count; index++) {
-    const struct set *set = &vt->sets[index];
-    if (set->kind != kind || set->id != id) continue;
-    if (set->size == size && !memcmp(set->data, data, size)) return 0;
-    at = index;
+  struct bits bits;
+  unescape(&bits, data, size, 8);
+  /* A sequence parameter set's id comes after its profile and level; a
+   * picture one's first, then the sequence one's it refers to. */
+  if (kind == SPS) read_bits(&bits, 24);
+  unsigned id = ue(&bits), sps = kind == PPS ? ue(&bits) : 0;
+  if (bits.at > bits.size * 8 || id >= (kind == SPS ? SPS_IDS : PPS_IDS) || sps >= SPS_IDS) {
+    return 0;
   }
-  if (at == MAX_SETS) return 0;
+  struct set *set = kind == SPS ? &vt->sps[id] : &vt->pps[id];
+  if (set->data && set->size == size && !memcmp(set->data, data, size)) return 0;
   uint8_t *copy = malloc(size);
   if (!copy) return -1;
   memcpy(copy, data, size);
-  if (at < vt->set_count) {
-    free(vt->sets[at].data);
-  } else {
-    vt->set_count++;
-  }
-  vt->sets[at] = (struct set){copy, size, kind, id};
-  vt->changed = 1;
+  free(set->data);
+  *set = (struct set){copy, (uint16_t)size, (uint8_t)sps, ++vt->stamps};
   return 0;
 }
 
-/* A session for the parameter sets kept, in place of any before. */
-static int start_session(struct yapfast_vt *vt) {
-  end_session(vt);
-  vt->changed = 0;
-  const uint8_t *sets[MAX_SETS];
-  size_t sizes[MAX_SETS];
-  size_t count = 0;
-  int said = -1;
-  /* Sequence parameter sets first. */
-  for (int pass = SPS; pass <= PPS; pass++) {
-    for (int index = 0; index < vt->set_count; index++) {
-      const struct set *set = &vt->sets[index];
-      if (set->kind != pass) continue;
-      if (pass == SPS && vt->asked < 0) {
-        int reorder = reorder_of(set);
-        said = reorder > said ? reorder : said;
-      }
-      sets[count] = set->data;
-      sizes[count++] = set->size;
-    }
+/* What VideoToolbox decodes a sequence parameter set and a picture one
+ * with, when they're of a size Yapfast decodes; NULL when not. */
+static CMVideoFormatDescriptionRef make_format(const struct yapfast_vt *vt, const struct set *sps,
+                                               const struct set *pps) {
+  const uint8_t *sets[2] = {sps->data, pps->data};
+  size_t sizes[2] = {sps->size, pps->size};
+  CMVideoFormatDescriptionRef format = NULL;
+  if (CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, sets, sizes,
+                                                          vt->length_size, &format) != noErr) {
+    return NULL;
   }
-  /* Without a delay from the caller, the stream's, never less than it was:
-   * pictures may have shown it was more. */
-  if (vt->asked < 0) {
-    int delay = said < 0 ? GUESSED_DELAY : said;
-    if (delay > vt->delay) vt->delay = delay;
-  }
-  if (CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, count, sets, sizes,
-                                                          vt->length_size, &vt->format) != noErr) {
-    vt->format = NULL;
-    return -1;
-  }
-  CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(vt->format);
+  CMVideoDimensions size = CMVideoFormatDescriptionGetDimensions(format);
   if (size.width <= 0 || size.height <= 0 || size.width > MAX_SIDE || size.height > MAX_SIDE) {
-    end_session(vt);
-    return -1;
+    CFRelease(format);
+    return NULL;
   }
+  return format;
+}
+
+/* A session for the format; when it can't start, the format goes and the
+ * decoder waits to start one again. */
+static int start_session(struct yapfast_vt *vt) {
+  vt->started = now();
   /* Bi-planar 4:2:0 in the stream's own range; libyuv takes it from there. */
   int32_t types[2] = {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                       kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
@@ -354,20 +373,50 @@ static int start_session(struct yapfast_vt *vt) {
     if (numbers[index]) CFRelease(numbers[index]);
   }
   if (accepted) CFRelease(accepted);
-  if (!attributes) {
-    end_session(vt);
-    return -1;
-  }
   VTDecompressionOutputCallbackRecord callback = {decoded, vt};
-  OSStatus made =
-      VTDecompressionSessionCreate(NULL, vt->format, NULL, attributes, &callback, &vt->session);
-  CFRelease(attributes);
+  OSStatus made = attributes ? VTDecompressionSessionCreate(NULL, vt->format, NULL, attributes,
+                                                            &callback, &vt->session)
+                             : kVTAllocationFailedErr;
+  if (attributes) CFRelease(attributes);
   if (made != noErr) {
     vt->session = NULL;
     end_session(vt);
+    vt->stopped = 1;
     return -1;
   }
+  vt->stopped = 0;
   return 0;
+}
+
+/* Readies a session for the parameter sets `slice` refers to, made from
+ * them alone. New ones, or ones under new ids, take a new session, from a
+ * picture it can start from: the pictures before one refer to ones this
+ * session decoded, so it goes on until then. VideoToolbox says a session
+ * can take a format of new ids of the same size, but then decodes nothing.
+ * After one stopped, one starts again only from such a picture too, and
+ * once a second at most, so a decoder that keeps failing doesn't make a
+ * session for every access unit. -1 without the sets or a session. */
+static int prepare(struct yapfast_vt *vt, const struct slice *slice) {
+  const struct set *pps = &vt->pps[slice->pps];
+  const struct set *sps = pps->data ? &vt->sps[pps->sps] : NULL;
+  if (!sps || !sps->data) return -1;
+  if (vt->session) {
+    if ((vt->format_sps == sps->stamp && vt->format_pps == pps->stamp) || !slice->starts) return 0;
+    end_session(vt);
+  } else if (vt->stopped && (!slice->starts || now() - vt->started < 1)) {
+    return -1;
+  }
+  vt->format = make_format(vt, sps, pps);
+  if (!vt->format) return -1;
+  vt->format_sps = sps->stamp;
+  vt->format_pps = pps->stamp;
+  /* Without a delay from the caller, the stream's, never less than it was:
+   * pictures may have shown it was more. */
+  if (vt->asked < 0) {
+    int said = reorder_of(sps), delay = said < 0 ? GUESSED_DELAY : said;
+    if (delay > vt->delay) vt->delay = delay;
+  }
+  return start_session(vt);
 }
 
 /* Keeps the parameter sets of an avcC box: its version, profile and level,
@@ -376,11 +425,12 @@ static int start_session(struct yapfast_vt *vt) {
  * when it's damaged or without memory. */
 static int read_record(struct yapfast_vt *vt, const uint8_t *record, size_t size) {
   if (size < 7) return -1;
-  /* Annex B access units are rewritten with four bytes, whatever the box says. */
+  /* Annex B access units are rewritten with four bytes, whatever the box
+   * says; another size takes a new format. */
   int length_size = (record[4] & 3) + 1;
   if (!vt->annexb && length_size != vt->length_size) {
     vt->length_size = length_size;
-    vt->changed = 1;
+    vt->format_sps = vt->format_pps = 0;
   }
   size_t at = 5;
   for (int pass = SPS; pass <= PPS; pass++) {
@@ -437,13 +487,19 @@ struct yapfast_vt *yapfast_vt_new(const uint8_t *record, size_t record_size, int
   if (!vt) return NULL;
   vt->asked = delay;
   vt->delay = delay < 0 ? 0 : delay < MAX_HELD ? delay : MAX_HELD - 1;
-  vt->shown = YAPFAST_VT_NO_TIME;
+  vt->shown = vt->before = YAPFAST_VT_NO_TIME;
   vt->length_size = 4;
   vt->annexb = !record || record_size == 0 || record[0] != 1;
   if (record && yapfast_vt_configure(vt, record, record_size) < 0) goto failed;
-  /* An MP4 file's parameter sets come first, so one that can't be decoded
-   * fails now. */
-  if (!vt->annexb && (!has_sets(vt) || start_session(vt) < 0)) goto failed;
+  if (!vt->annexb) {
+    /* An MP4 file's parameter sets come first, so one that can't be decoded
+     * fails now: a session for its first picture parameter set. */
+    struct slice first = {.pps = PPS_IDS, .starts = 1};
+    for (unsigned id = 0; id < PPS_IDS && first.pps == PPS_IDS; id++) {
+      if (vt->pps[id].data) first.pps = id;
+    }
+    if (first.pps == PPS_IDS || prepare(vt, &first) < 0) goto failed;
+  }
   return vt;
 failed:
   yapfast_vt_free(vt);
@@ -481,19 +537,27 @@ static long rewrite(struct yapfast_vt *vt, const uint8_t *data, size_t size) {
   return (long)written;
 }
 
-/* Keeps the parameter sets among an MP4 access unit's NAL units, as a file
- * may change them in its samples; -1 without memory. */
-static int keep_sets_in(struct yapfast_vt *vt, const uint8_t *data, size_t size) {
+/* Keeps the parameter sets among an access unit's NAL units after their
+ * lengths, as an MP4 file may change them in its samples, and reads its
+ * first slice: 1 with one, 0 without, -1 with a damaged one or without
+ * memory. */
+static int scan(struct yapfast_vt *vt, const uint8_t *unit, size_t size, struct slice *slice) {
+  int found = 0;
   size_t at = 0;
   while (at + (size_t)vt->length_size < size) {
     size_t nal_size = 0;
-    for (int index = 0; index < vt->length_size; index++) nal_size = nal_size << 8 | data[at++];
-    if (nal_size == 0 || nal_size > size - at) return 0;
-    int type = data[at] & 0x1f;
-    if ((type == SPS || type == PPS) && keep_set(vt, data + at, nal_size) < 0) return -1;
+    for (int index = 0; index < vt->length_size; index++) nal_size = nal_size << 8 | unit[at++];
+    if (nal_size == 0 || nal_size > size - at) break;
+    const uint8_t *nal = unit + at;
+    int type = nal[0] & 0x1f;
+    if ((type == SPS || type == PPS) && keep_set(vt, nal, nal_size) < 0) return -1;
+    if ((type == SLICE || type == IDR) && !found) {
+      if (!read_slice(nal, nal_size, slice)) return -1;
+      found = 1;
+    }
     at += nal_size;
   }
-  return 0;
+  return found;
 }
 
 /* Decodes an access unit with lengths: what VideoToolbox said of it, as it
@@ -521,6 +585,11 @@ static OSStatus decode_unit(struct yapfast_vt *vt, const uint8_t *unit, size_t s
   return status != noErr ? status : vt->status;
 }
 
+/* Whether VideoToolbox says the session stopped working. */
+static int session_stopped(OSStatus status) {
+  return status == kVTInvalidSessionErr || status == kVTVideoDecoderMalfunctionErr;
+}
+
 int yapfast_vt_send(struct yapfast_vt *vt, const uint8_t *data, size_t size, int64_t time,
                     int cut) {
   const uint8_t *unit = data;
@@ -530,20 +599,27 @@ int yapfast_vt_send(struct yapfast_vt *vt, const uint8_t *data, size_t size, int
     if (written < 0) return -1;
     unit = vt->unit;
     unit_size = (size_t)written;
-  } else if (keep_sets_in(vt, data, size) < 0) {
-    return -1;
   }
-  /* A session for parameter sets that changed, or in place of one that
-   * stopped or couldn't start. */
-  if ((vt->changed || !vt->session) && has_sets(vt) && start_session(vt) < 0) return -1;
-  if (unit_size == 0) return 0;
-  if (!vt->session) return -1;
+  /* A unit of parameter sets alone, or of other NAL units, has no picture. */
+  struct slice slice;
+  int found = scan(vt, unit, unit_size, &slice);
+  if (found <= 0) return found;
+  if (prepare(vt, &slice) < 0) return -1;
+  if (slice.idr) vt->epoch++;
   OSStatus status = decode_unit(vt, unit, unit_size, time, cut);
-  if (status == kVTInvalidSessionErr || status == kVTVideoDecoderMalfunctionErr) {
+  if (session_stopped(status)) {
     /* A session can stop working, as when the Mac sleeps: a new one decodes
-     * the unit again, or, when it can't start, the next unit tries. */
-    if (start_session(vt) == 0) status = decode_unit(vt, unit, unit_size, time, cut);
-    if (status == kVTInvalidSessionErr || status == kVTVideoDecoderMalfunctionErr) end_session(vt);
+     * the unit again when it can start from it, and otherwise the next unit
+     * that can starts one. */
+    end_session(vt);
+    vt->stopped = 1;
+    if (slice.starts && prepare(vt, &slice) == 0) {
+      status = decode_unit(vt, unit, unit_size, time, cut);
+    }
+    if (session_stopped(status)) {
+      end_session(vt);
+      vt->stopped = 1;
+    }
   }
   return status == noErr ? 0 : -1;
 }
@@ -596,23 +672,34 @@ static int convert(struct yapfast_vt *vt, CVPixelBufferRef buffer,
 
 int yapfast_vt_receive(struct yapfast_vt *vt, struct yapfast_vt_picture *picture) {
   for (;;) {
-    if (vt->held_count == 0 || (!vt->draining && vt->held_count <= vt->delay)) return 0;
+    /* Pictures from before the last IDR one go at once: none decoded after
+     * shows before them. */
+    if (vt->held_count == 0 ||
+        (!vt->draining && vt->held_count <= vt->delay && vt->held[0].epoch == vt->epoch)) {
+      return 0;
+    }
     struct held next = vt->held[0];
     vt->held_count--;
     memmove(vt->held, vt->held + 1, (size_t)vt->held_count * sizeof *vt->held);
-    /* A picture that shows before the last one given came too late: B-frames
-     * reorder by more than was held back, so one more is from now on. */
-    if (next.time != YAPFAST_VT_NO_TIME && vt->shown != YAPFAST_VT_NO_TIME &&
-        next.time < vt->shown) {
-      CVPixelBufferRelease(next.buffer);
-      if (vt->delay < MAX_HELD - 1) vt->delay++;
-      continue;
+    if (next.time != YAPFAST_VT_NO_TIME) {
+      /* A picture that shows before the last one given, but after the one
+       * before that, came too late: B-frames reorder by more than was held
+       * back, so one more is from now on. One further back is where the
+       * file's times jump back, and shows. */
+      int along = vt->shown != YAPFAST_VT_NO_TIME && next.epoch == vt->shown_epoch;
+      if (along && next.time < vt->shown && next.time > vt->before && vt->delay < MAX_HELD - 1) {
+        CVPixelBufferRelease(next.buffer);
+        vt->delay++;
+        continue;
+      }
+      vt->before = along ? vt->shown : YAPFAST_VT_NO_TIME;
+      vt->shown = next.time;
+      vt->shown_epoch = next.epoch;
     }
     int converted = convert(vt, next.buffer, picture);
     CVPixelBufferRelease(next.buffer);
     if (converted < 0) return converted;
     picture->time = next.time;
-    if (next.time != YAPFAST_VT_NO_TIME) vt->shown = next.time;
     return 1;
   }
 }
@@ -626,6 +713,7 @@ void yapfast_vt_flush(struct yapfast_vt *vt) {
   /* The next access unit starts a new session, so the pictures after the
    * keyframe sought to can't refer to any from before it. */
   end_session(vt);
+  vt->stopped = 0;
   vt->draining = 0;
-  vt->shown = YAPFAST_VT_NO_TIME;
+  vt->shown = vt->before = YAPFAST_VT_NO_TIME;
 }

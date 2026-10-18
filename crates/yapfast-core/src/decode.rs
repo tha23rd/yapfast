@@ -214,4 +214,32 @@ mod tests {
             .unwrap();
         check(Codec::H264, &h264[..second]);
     }
+
+    #[test]
+    fn follows_parameter_sets_to_new_ids() {
+        // Twelve pairs of pictures, each pair after parameter sets of ids of
+        // its own and of another size, as a sender may rotate them. A
+        // damaged sequence parameter set under an id of its own changes
+        // nothing.
+        let h264 = fixture("stream-h264-ids.h264");
+        let mut starts: Vec<_> = (0..h264.len() - 4)
+            .filter(|&at| h264[at..at + 5] == [0, 0, 0, 1, 9])
+            .collect();
+        starts.push(h264.len());
+        let mut decoder = Decoder::new(Codec::H264).unwrap();
+        let mut sizes = vec![];
+        for (index, unit) in starts.windows(2).enumerate() {
+            let mut unit = h264[unit[0]..unit[1]].to_vec();
+            if index == 5 {
+                let damaged = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0x04, 0x1f, 0xff, 0xff];
+                unit.splice(0..0, damaged);
+            }
+            let picture = decoder.decode(&unit).unwrap().expect("a picture");
+            sizes.push((picture.width, picture.height));
+        }
+        let expected: Vec<_> = (0..24)
+            .map(|index| [(32, 18), (48, 32)][index / 2 % 2])
+            .collect();
+        assert_eq!(sizes, expected);
+    }
 }

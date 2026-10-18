@@ -537,6 +537,28 @@ mod tests {
     }
 
     #[test]
+    fn plays_on_where_times_jump_back() {
+        // Each of three GOPs 10 s before the one before it, from its IDR
+        // picture on, with B-frames reordering pictures on both sides of
+        // the jump; and a GOP without them whose times jump back halfway.
+        // FFmpeg's decoder gives these.
+        let gops = |starts: &[u64]| -> Vec<u64> {
+            starts
+                .iter()
+                .flat_map(|start| (0..15).map(move |index| start + index * 40))
+                .collect()
+        };
+        for (name, expected) in [
+            ("video-jumps-back.mkv", gops(&[20_000, 10_600, 1200])),
+            ("video-jumps-back-midway.mkv", gops(&[10_000, 600])),
+        ] {
+            let data = fixture(name);
+            let mut video = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
+            assert_eq!(timeline(&mut video).0, expected, "{name}");
+        }
+    }
+
+    #[test]
     fn reorders_pictures_by_what_the_stream_says() {
         // Matroska doesn't say how far B-frames reorder pictures; H264's
         // sequence parameter set does.
